@@ -27,8 +27,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 bytes = "1"
+samael = "0.0.22"
+rand = "0.9"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"

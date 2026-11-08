@@ -124,6 +124,37 @@ pub struct AbsMeResponse {
     pub username: String,
 }
 
+/// One entry of ABS's admin-only GET /api/users.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AbsUserSummary {
+    pub id: String,
+    pub username: String,
+    /// "root", "admin", "user" or "guest".
+    #[serde(rename = "type")]
+    pub user_type: String,
+    pub is_active: bool,
+}
+
+/// An ABS API key as listed by GET /api/api-keys (the secret itself is never listed).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AbsApiKey {
+    pub id: String,
+    pub name: String,
+    pub user_id: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The reply to POST /api/api-keys: the only time ABS shows the key's secret.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AbsApiKeyCreated {
+    pub id: String,
+    /// The secret, a JWT that works as a Bearer token.
+    pub api_key: String,
+}
+
 pub type RoomId = String;
 pub type ParticipantId = Uuid;
 

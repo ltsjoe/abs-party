@@ -19,12 +19,18 @@ const router = createRouter({
 // Wrapped in an IIFE to avoid top-level await (not supported by ES2020 target).
 ;(async () => {
   let absBaseUrl = ''
+  let loginOptions = { local: true, saml: false, samlLabel: '' }
   try {
     const cfg = await fetch('/api/config').then((r) => r.json())
     absBaseUrl = cfg.abs_base_url || ''
+    loginOptions = {
+      local: cfg.local_login !== false,
+      saml: !!cfg.saml_login,
+      samlLabel: cfg.saml_login_label || '',
+    }
   } catch {
     console.warn('Could not fetch /api/config — ABS base URL will be empty')
   }
 
-  createApp(App, { absBaseUrl }).use(router).mount('#app')
+  createApp(App, { absBaseUrl, loginOptions }).use(router).mount('#app')
 })()

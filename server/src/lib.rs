@@ -3,6 +3,7 @@ pub mod config;
 pub mod hub;
 pub mod models;
 pub mod room;
+pub mod saml;
 pub mod ws_handler;
 
 use std::sync::Arc;
@@ -22,12 +23,15 @@ use tower_http::{
 use abs_client::AbsClient;
 use config::Config;
 use hub::{new_room_map, RoomMap};
+use saml::Saml;
 
 #[derive(Clone)]
 pub struct AppState {
     pub rooms: RoomMap,
     pub abs: Arc<AbsClient>,
     pub config: Config,
+    /// Set when SAML sign-in is configured and its IdP metadata loaded.
+    pub saml: Option<Arc<Saml>>,
 }
 
 fn build_cors(config: &Config) -> CorsLayer {
@@ -49,16 +53,33 @@ fn build_cors(config: &Config) -> CorsLayer {
 }
 
 pub fn build_app(config: Config) -> Router {
+    build_app_with_saml(config, None)
+}
+
+pub fn build_app_with_saml(config: Config, saml: Option<Arc<Saml>>) -> Router {
     let state = AppState {
         rooms: new_room_map(),
         abs: Arc::new(AbsClient::new(config.abs_base_url.clone())),
         config: config.clone(),
+        saml,
     };
 
-    Router::new()
-        .route("/ws", get(ws_upgrade))
-        .route("/api/abs/login", post(abs_login_proxy))
-        .route("/api/abs/validate-key", post(abs_validate_key_proxy))
+    let mut router = Router::new().route("/ws", get(ws_upgrade));
+    if config.local_login {
+        router = router
+            .route("/api/abs/login", post(abs_login_proxy))
+            .route("/api/abs/validate-key", post(abs_validate_key_proxy));
+    }
+    if state.saml.is_some() {
+        router = router
+            .route("/auth/saml/login", get(saml::login))
+            .route("/auth/saml/acs", post(saml::acs))
+            .route("/auth/saml/metadata", get(saml::metadata))
+            .route("/api/auth/sso/redeem", post(saml::redeem))
+            .route("/api/auth/sso/logout", post(saml::logout));
+    }
+
+    router
         .route("/api/abs-proxy/*path", any(abs_proxy))
         .route("/api/config", get(api_config))
         .route("/health", get(|| async { "ok" }))
@@ -82,7 +103,17 @@ pub async fn run() {
 
     let config = Config::from_env();
     let bind = config.bind.clone();
-    let app = build_app(config);
+    let saml = match config.saml.clone() {
+        Some(saml_config) => {
+            let saml = Saml::load(saml_config)
+                .await
+                .unwrap_or_else(|e| panic!("SAML setup failed: {e:#}"));
+            tracing::info!("SAML sign-in enabled");
+            Some(Arc::new(saml))
+        }
+        None => None,
+    };
+    let app = build_app_with_saml(config, saml);
 
     tracing::info!("abs-party listening on {bind}");
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -145,7 +176,10 @@ async fn abs_validate_key_proxy(
 
 async fn api_config(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "abs_base_url": state.config.abs_base_url
+        "abs_base_url": state.config.abs_base_url,
+        "local_login": state.config.local_login,
+        "saml_login": state.saml.is_some(),
+        "saml_login_label": state.config.saml.as_ref().map(|s| s.login_label.as_str()),
     }))
 }
 
