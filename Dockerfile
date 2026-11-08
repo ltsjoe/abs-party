@@ -10,7 +10,12 @@ COPY client/ ./client/
 RUN cd client && npm run build
 
 # Stage 2: Build Rust backend (needs ≥ 1.85 for edition 2024 in deps)
-FROM rust:slim AS backend-builder
+# Same Debian release as the runtime stage: SAML (samael) links libxml2 and xmlsec1
+# dynamically, so build and runtime library versions must match.
+FROM rust:1-slim-bookworm AS backend-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libclang-dev clang libxml2-dev libxmlsec1-dev libssl-dev libltdl-dev \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/server
 # Cache dependencies separately
 COPY server/Cargo.toml server/Cargo.lock* ./
@@ -24,7 +29,9 @@ RUN find src -name "*.rs" -exec touch {} + && cargo build --release
 
 # Stage 3: Runtime image
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libxml2 libxmlsec1 libxmlsec1-openssl libssl3 libltdl7 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=backend-builder /app/server/target/release/abs-party ./
 COPY --from=frontend-builder /app/server/static/ ./static/

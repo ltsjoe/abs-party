@@ -1,7 +1,7 @@
 use anyhow::Result;
 use reqwest::{Client, header};
 
-use crate::models::{AbsLoginResponse, AbsMeResponse};
+use crate::models::{AbsApiKey, AbsApiKeyCreated, AbsLoginResponse, AbsMeResponse, AbsUserSummary};
 
 pub struct AbsClient {
     client: Client,
@@ -70,5 +70,84 @@ impl AbsClient {
             .map(|s| s.to_string());
         let bytes = resp.bytes().await?;
         Ok((status, bytes, content_type))
+    }
+
+    // --- Admin calls, made with the admin API key during SAML sign-in ---
+
+    pub async fn list_users(&self, admin_key: &str) -> Result<Vec<AbsUserSummary>> {
+        #[derive(serde::Deserialize)]
+        struct Users {
+            users: Vec<AbsUserSummary>,
+        }
+        let resp = self
+            .client
+            .get(format!("{}/api/users", self.base_url))
+            .bearer_auth(admin_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Users>()
+            .await?;
+        Ok(resp.users)
+    }
+
+    /// Mints an active API key that acts as `user_id` and expires after `expires_in_secs`.
+    pub async fn create_api_key(
+        &self,
+        admin_key: &str,
+        name: &str,
+        user_id: &str,
+        expires_in_secs: u64,
+    ) -> Result<AbsApiKeyCreated> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Created {
+            api_key: AbsApiKeyCreated,
+        }
+        let resp = self
+            .client
+            .post(format!("{}/api/api-keys", self.base_url))
+            .bearer_auth(admin_key)
+            // ABS creates keys inactive unless told otherwise.
+            .json(&serde_json::json!({
+                "name": name,
+                "userId": user_id,
+                "expiresIn": expires_in_secs,
+                "isActive": true,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Created>()
+            .await?;
+        Ok(resp.api_key)
+    }
+
+    pub async fn list_api_keys(&self, admin_key: &str) -> Result<Vec<AbsApiKey>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Keys {
+            api_keys: Vec<AbsApiKey>,
+        }
+        let resp = self
+            .client
+            .get(format!("{}/api/api-keys", self.base_url))
+            .bearer_auth(admin_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Keys>()
+            .await?;
+        Ok(resp.api_keys)
+    }
+
+    pub async fn delete_api_key(&self, admin_key: &str, key_id: &str) -> Result<()> {
+        self.client
+            .delete(format!("{}/api/api-keys/{}", self.base_url, key_id))
+            .bearer_auth(admin_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }

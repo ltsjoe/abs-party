@@ -198,6 +198,8 @@ watch(connected, (val, old) => {
 
 onMounted(async () => {
   if (!auth.token) {
+    // Come back here after signing in (Home.vue reads this).
+    try { sessionStorage.setItem('abs_party_return', route.fullPath) } catch { /* storage unavailable */ }
     fatalError.value = 'You must be signed in to join a room.'
     return
   }

@@ -16,9 +16,11 @@
 <script setup>
 import { reactive, provide } from 'vue'
 import { useRouter } from 'vue-router'
+import { ssoLogout } from './api/abs.js'
 
 const props = defineProps({
   absBaseUrl: { type: String, default: '' },
+  loginOptions: { type: Object, default: () => ({ local: true, saml: false, samlLabel: '' }) },
 })
 
 const router = useRouter()
@@ -27,30 +29,41 @@ const auth = reactive({
   token: localStorage.getItem('abs_token') || '',
   username: localStorage.getItem('abs_username') || '',
   userId: localStorage.getItem('abs_user_id') || '',
+  // Set when signed in through SAML: the ABS API key the server minted for us.
+  ssoKeyId: localStorage.getItem('abs_sso_key_id') || '',
 })
 
-function setAuth(token, username, userId) {
+function setAuth(token, username, userId, ssoKeyId = '') {
   auth.token = token
   auth.username = username
   auth.userId = userId
+  auth.ssoKeyId = ssoKeyId
   localStorage.setItem('abs_token', token)
   localStorage.setItem('abs_username', username)
   localStorage.setItem('abs_user_id', userId)
+  if (ssoKeyId) localStorage.setItem('abs_sso_key_id', ssoKeyId)
+  else localStorage.removeItem('abs_sso_key_id')
 }
 
-function logout() {
+async function logout() {
+  if (auth.ssoKeyId) {
+    try { await ssoLogout(auth.token, auth.ssoKeyId) } catch { /* key expires anyway */ }
+  }
   auth.token = ''
   auth.username = ''
   auth.userId = ''
+  auth.ssoKeyId = ''
   localStorage.removeItem('abs_token')
   localStorage.removeItem('abs_username')
   localStorage.removeItem('abs_user_id')
+  localStorage.removeItem('abs_sso_key_id')
   router.push('/')
 }
 
 provide('auth', auth)
 provide('setAuth', setAuth)
 provide('ABS_BASE', props.absBaseUrl)
+provide('loginOptions', props.loginOptions)
 </script>
 
 <style scoped>

@@ -50,8 +50,86 @@ Display names are taken from the ABS username and cannot be overridden. Two part
 | `CORS_ORIGIN` | no | -- | Allowed cross-origin (e.g. `http://localhost:5173` for Vite dev). Omit in production. |
 | `RUST_LOG` | no | -- | Log filter (e.g. `abs_party=info`) |
 | `BYPASS_AUTH` | no | `0` | Set to `1` to skip ABS token validation. Never use in production. |
+| `LOCAL_LOGIN` | no | `1` | Set to `0` to turn off the ABS username/password and API key sign-in. Needs SAML configured. |
+| `SAML_IDP_METADATA_URL` / `SAML_IDP_METADATA_FILE` | no | -- | IdP metadata. Setting either one turns on SAML sign-in (see below). |
+| `PUBLIC_URL` | with SAML | -- | Public `https://` URL of this server, no trailing slash. |
+| `ABS_ADMIN_API_KEY` / `ABS_ADMIN_API_KEY_FILE` | with SAML | -- | API key of an ABS admin user, used to mint per-user keys. |
+| `SAML_USERNAME_ATTRIBUTE` | no | Authentik's username attribute | SAML attribute holding the ABS username, or `NameID`. |
+| `SAML_SP_ENTITY_ID` | no | `$PUBLIC_URL/auth/saml/metadata` | SP entity ID; the IdP's audience must match it. |
+| `SSO_KEY_TTL_HOURS` | no | `12` | Lifetime of the ABS key minted for each SAML sign-in. |
+| `SAML_LOGIN_LABEL` | no | `Sign in with single sign-on` | Text of the sign-in button. |
 
 Copy `abs-party.env.example` and edit it before deploying.
+
+
+## SAML sign-in
+
+Optional single sign-on through a SAML identity provider, written for
+[Authentik](https://goauthentik.io/); any SAML 2.0 IdP that signs its assertions
+should work. The test suite runs the full flow against a signing test IdP and a mock
+ABS; it has not yet been tried against a live Authentik.
+
+### How it works
+
+Listeners still need their own ABS account, and each one still streams from and
+saves progress to that account. SAML only replaces typing the ABS password:
+
+1. **Sign in** sends the browser to the IdP with a SAML AuthnRequest (HTTP-Redirect).
+2. The IdP posts a signed response back to `/auth/saml/acs`. The server checks the
+   signature against the IdP metadata's certificate, plus the audience, recipient,
+   time window and `InResponseTo`. A short-lived HttpOnly cookie ties the response to
+   the browser that started the sign-in, and each request ID is accepted only once.
+3. The server finds the ABS user with the same username (case-insensitive, like ABS)
+   and, using the admin API key, mints an ABS API key for that user
+   (`POST /api/api-keys`, named `abs-party-sso:<user>:<time>`, expires after
+   `SSO_KEY_TTL_HOURS`).
+4. The browser gets that key through a single-use code (`/?sso=<code>`, valid 60 s),
+   so the key itself never shows up in a URL. From there on it works exactly like a
+   token from the password sign-in.
+5. **Logout** deletes the key from ABS. Keys left behind expire on their own, and
+   expired `abs-party-sso:` keys are deleted on later sign-ins.
+
+Refused: users with no matching ABS account (the server never creates ABS users),
+disabled ABS users, and the ABS **root** user (an SSO path to root would turn the IdP
+account into the root key).
+
+### Security trade-off
+
+Without SAML this server holds no credentials. **With SAML it holds an ABS admin API
+key**, so a compromise of this server is a compromise of ABS. Use a dedicated ABS
+user of type *admin* (not root), keep the key in a file (`ABS_ADMIN_API_KEY_FILE`),
+and keep this server patched.
+
+The server refuses to start if the IdP metadata has no signing certificate: the SAML
+library skips signature checks entirely without one. It accepts RSA or ECDSA
+signatures with SHA-256/384/512 only, so SHA-1 is refused.
+
+### Setup with Authentik
+
+1. **ABS:** create a user of type *admin* for the party server (e.g. `abs-party`) and
+   an API key for it (*Settings → API Keys*, ABS 2.26 or later). Every listener needs
+   an ABS user whose username equals their Authentik username.
+2. **Authentik:** *Applications → Providers → Create → SAML Provider*:
+   - **ACS URL:** `https://party.example.com/auth/saml/acs`
+   - **Service Provider Binding:** Post
+   - **Audience:** `https://party.example.com/auth/saml/metadata` (must equal `SAML_SP_ENTITY_ID`)
+   - **Signing Certificate:** any certificate, with **Sign assertions** on
+   - **Digest / Signature algorithm:** SHA256 / RSA-SHA256 (the defaults)
+   - Property mappings: keep the default *authentik default SAML Mapping: Username*,
+     which sends `http://schemas.goauthentik.io/2021/02/saml/username`.
+
+   Then create an application for the provider and bind the users or group allowed in.
+   Or import this server's metadata from `https://party.example.com/auth/saml/metadata`.
+3. **Party server:** set `SAML_IDP_METADATA_URL` to the provider's metadata URL
+   (*Download metadata* on the provider page, or
+   `https://auth.example.com/api/v3/providers/saml/<id>/metadata/?download`),
+   plus `PUBLIC_URL` and `ABS_ADMIN_API_KEY_FILE`. The metadata is read once at
+   startup, so restart the server after rotating the Authentik certificate.
+4. Once SSO works, `LOCAL_LOGIN=0` hides the password form.
+
+Building from source needs libxml2, xmlsec1 (OpenSSL backend), libltdl and libclang;
+on Debian: `apt install pkg-config libclang-dev libxml2-dev libxmlsec1-dev libssl-dev libltdl-dev`.
+The Dockerfile does this.
 
 
 ## Docker with lima/nerdctl

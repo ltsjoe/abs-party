@@ -18,6 +18,26 @@ export async function login(username, password) {
   return resp.json()
 }
 
+export async function redeemSso(code) {
+  const resp = await fetch('/api/auth/sso/redeem', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  })
+  if (!resp.ok) throw new Error('Sign-in expired')
+  return resp.json()
+}
+
+// Deletes the ABS API key the server minted for this SSO sign-in. Best effort:
+// the key expires on its own anyway.
+export async function ssoLogout(token, keyId) {
+  await fetch('/api/auth/sso/logout', {
+    method: 'POST',
+    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key_id: keyId }),
+  })
+}
+
 export async function getMe(_absBase, token) {
   const resp = await fetch(`${PROXY}/api/me`, { headers: authHeaders(token) })
   if (!resp.ok) throw new Error('Failed to fetch user')
