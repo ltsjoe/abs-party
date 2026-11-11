@@ -1,6 +1,8 @@
 import { ref, onUnmounted } from 'vue'
 import Hls from 'hls.js'
 import { startPlaybackSession, syncProgress, closeSession, getProgress, createBookmark } from '../api/abs.js'
+import { episodeBookmarkTitle, canBookmarkAt } from '../utils/bookmarks.js'
+import { normalizeChapters } from '../utils/chapters.js'
 
 const SYNC_INTERVAL_MS = 10_000
 
@@ -26,6 +28,13 @@ export function useAbsPlayer(absBase) {
   let lastSyncTime = 0
   let currentToken = null
   let currentItemId = null
+  // Podcast rooms: the episode playing, and the name its bookmarks carry.
+  let currentEpisodeId = null
+  let currentEpisodeLabel = ''
+  // True once a pre_party bookmark was really saved (the room says so).
+  const preJoinBookmarkSaved = ref(false)
+  // The book's (or episode's) chapters from the playback session, sorted.
+  const chapters = ref([])
 
   audio.addEventListener('timeupdate', () => {
     const offset = tracks[trackIndex]?.startOffset ?? 0
@@ -51,14 +60,19 @@ export function useAbsPlayer(absBase) {
     }
   })
 
-  async function open(token, libraryItemId) {
+  // `episodeId` is set for a podcast episode, null for a book. `episodeLabel`
+  // is the episode's name, used in its bookmark titles (utils/bookmarks.js).
+  async function open(token, libraryItemId, { episodeId = null, episodeLabel = '' } = {}) {
     currentToken = token
     currentItemId = libraryItemId
+    currentEpisodeId = episodeId
+    currentEpisodeLabel = episodeId ? episodeLabel : ''
 
-    await savePreJoinBookmark(token, libraryItemId)
+    preJoinBookmarkSaved.value = await savePreJoinBookmark(token, libraryItemId)
 
-    const session = await startPlaybackSession(null, token, libraryItemId)
+    const session = await startPlaybackSession(null, token, libraryItemId, episodeId)
     sessionId.value = session.id
+    chapters.value = normalizeChapters(session.chapters)
 
     const audioTracks = session.audioTracks ?? []
 
@@ -110,14 +124,19 @@ export function useAbsPlayer(absBase) {
     audio.load()
   }
 
+  // Returns true when a bookmark was saved.
   async function savePreJoinBookmark(token, libraryItemId) {
     try {
-      const progress = await getProgress(null, token, libraryItemId)
+      const progress = await getProgress(null, token, libraryItemId, currentEpisodeId)
       const time = Math.max(0, progress?.currentTime ?? 0)
+      if (!canBookmarkAt(currentEpisodeLabel, time)) return false
       const ts = new Date().toISOString().slice(0, 19)
-      await createBookmark(null, token, libraryItemId, time, `pre_party_${ts}`)
+      await createBookmark(null, token, libraryItemId, time,
+        episodeBookmarkTitle(`pre_party_${ts}`, currentEpisodeLabel))
+      return true
     } catch (e) {
       console.warn('Could not save pre-join bookmark:', e)
+      return false
     }
   }
 
@@ -202,9 +221,12 @@ export function useAbsPlayer(absBase) {
     if (sessionId.value && currentToken && currentItemId) {
       const time = Math.max(0, currentTime.value)
       const ts = new Date().toISOString().slice(0, 19)
-      try {
-        await createBookmark(null, currentToken, currentItemId, time, `leave_${ts}`)
-      } catch {}
+      if (canBookmarkAt(currentEpisodeLabel, time)) {
+        try {
+          await createBookmark(null, currentToken, currentItemId, time,
+            episodeBookmarkTitle(`leave_${ts}`, currentEpisodeLabel))
+        } catch {}
+      }
       try {
         await closeSession(null, currentToken, sessionId.value, time, listenedSinceSync)
       } catch {}
@@ -215,5 +237,5 @@ export function useAbsPlayer(absBase) {
 
   onUnmounted(close)
 
-  return { open, play, pause, seekTo, setSpeed, setVolume, close, currentTime, duration, volume, isPlaying, audio }
+  return { open, play, pause, seekTo, setSpeed, setVolume, close, currentTime, duration, volume, isPlaying, preJoinBookmarkSaved, chapters, audio }
 }

@@ -16,6 +16,9 @@ pub enum ClientMessage {
         item_title: String,
         item_author: String,
         library_id: String,
+        /// Set when the room plays one podcast episode; absent for a book.
+        #[serde(default)]
+        episode_id: Option<String>,
     },
     PlayIntent {
         position: f64,
@@ -86,14 +89,34 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    /// ABS refused the browser's token (it expired, or was deleted). The page
+    /// clears it and asks the person to sign in again.
+    AuthFailed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ItemInfo {
     pub id: String,
     pub library_id: String,
+    /// The podcast episode this room plays (an ABS episode id), or None for a
+    /// book. For an episode, `title` is the episode's and `author` the podcast's.
+    #[serde(default)]
+    pub episode_id: Option<String>,
     pub title: String,
     pub author: String,
+}
+
+/// True for something shaped like an ABS id: a UUID (current ABS) or an old
+/// "li_..."/"ep_..." id. A room's ids come from its host and end up in every
+/// guest's relay calls (`api/items/<id>/play/<episode id>`), so only plain id
+/// characters pass: no `/`, `.` or `%` that could point a guest's own token
+/// at some other ABS path.
+pub fn is_abs_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -208,11 +231,47 @@ mod tests {
     }
 
     #[test]
+    fn server_message_auth_failed_serializes() {
+        let msg = ServerMessage::AuthFailed { message: "again".into() };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"auth_failed""#));
+    }
+
+    #[test]
     fn item_info_roundtrips() {
-        let item = ItemInfo { id: "i".into(), library_id: "l".into(), title: "T".into(), author: "A".into() };
+        let item = ItemInfo { id: "i".into(), library_id: "l".into(), episode_id: None, title: "T".into(), author: "A".into() };
         let json = serde_json::to_string(&item).unwrap();
         let back: ItemInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "i");
         assert_eq!(back.title, "T");
+        assert_eq!(back.episode_id, None);
+    }
+
+    #[test]
+    fn create_room_without_episode_is_a_book() {
+        let json = r#"{"type":"create_room","room_id":"abcd1234","abs_token":"t","item_id":"i1","item_title":"Book","item_author":"Auth","library_id":"l1"}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ClientMessage::CreateRoom { episode_id: None, .. }));
+    }
+
+    #[test]
+    fn create_room_with_episode_deserializes() {
+        let json = r#"{"type":"create_room","room_id":"abcd1234","abs_token":"t","item_id":"i1","item_title":"Ep 1","item_author":"Show","library_id":"l1","episode_id":"ep_1"}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMessage::CreateRoom { episode_id, .. } => assert_eq!(episode_id.as_deref(), Some("ep_1")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abs_ids_accept_uuids_and_old_ids_only() {
+        assert!(is_abs_id("0b1c2d3e-aaaa-4bbb-8ccc-1234567890ab"));
+        assert!(is_abs_id("li_8gch9ve09orgn4fdz8"));
+        assert!(is_abs_id("ep_lh6ko39pumnrma3dhv"));
+        let too_long = "x".repeat(65);
+        for bad in ["", "..", "a/b", "a.b", "%2e%2e", "a b", "a?b", too_long.as_str()] {
+            assert!(!is_abs_id(bad), "{bad:?} should be refused");
+        }
     }
 }

@@ -117,6 +117,8 @@ async fn spawn_mock_abs() -> (String, Mock) {
                     Some("Bearer jwt-for-other") => {
                         Ok(Json(json!({ "id": "u-other", "username": "other" })))
                     }
+                    // Stands in for ABS failing (not refusing the token).
+                    Some("Bearer abs-is-down") => Err(StatusCode::INTERNAL_SERVER_ERROR),
                     _ => Err(StatusCode::UNAUTHORIZED),
                 }
             }),
@@ -523,6 +525,160 @@ async fn logout_deletes_only_the_callers_own_key() {
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(h.mock.lock().unwrap().deleted, vec!["key-1".to_string()]);
+}
+
+/// Makes the mock's key `id` run out in `hours`, as if it was minted a while ago.
+fn set_key_expiry(h: &Harness, id: &str, hours: i64) {
+    let at = (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339();
+    let mut m = h.mock.lock().unwrap();
+    let key = m.keys.iter_mut().find(|k| k["id"] == id).unwrap();
+    key["expiresAt"] = json!(at);
+}
+
+#[tokio::test]
+async fn renew_swaps_a_due_key_and_deletes_the_one_before_it() {
+    let h = harness().await;
+    let (id, _) = h.start_login().await;
+    h.post_acs(Some(&id), &h.idp.signed_response(&id, "alice"))
+        .await;
+    // The test TTL is 12 h, so a key with 5 h left is past half time.
+    set_key_expiry(&h, "key-1", 5);
+
+    let (status, body) = h
+        .post_json(
+            "/api/auth/sso/renew",
+            Some("jwt-for-u-alice"),
+            json!({ "key_id": "key-1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["key_id"], "key-2");
+    assert_eq!(body["token"], "jwt-for-u-alice");
+    assert_eq!(body["user"]["id"], "u-alice");
+    assert_eq!(body["user"]["username"], "Alice");
+
+    // Renewing key-1 again (another tab, a lost reply, or someone replaying it)
+    // hands back key-2 rather than minting yet another key.
+    let (status, again) = h
+        .post_json(
+            "/api/auth/sso/renew",
+            Some("jwt-for-u-alice"),
+            json!({ "key_id": "key-1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["key_id"], "key-2");
+    {
+        let m = h.mock.lock().unwrap();
+        assert!(m.deleted.is_empty(), "key-1 stays, for tabs still using it");
+        assert_eq!(m.created.len(), 2);
+        assert_eq!(m.created[1]["userId"], "u-alice");
+        assert_eq!(m.created[1]["expiresIn"], 12 * 3600);
+        assert!(m.created[1]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{KEY_PREFIX}Alice:")));
+    }
+
+    // Next renewal: someone else's SSO key named as "previous" is left alone.
+    h.mock.lock().unwrap().keys.push(json!({
+        "id": "key-others", "name": format!("{KEY_PREFIX}other:2026"), "userId": "u-other",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+    }));
+    set_key_expiry(&h, "key-2", 5);
+    let (status, body) = h
+        .post_json(
+            "/api/auth/sso/renew",
+            Some("jwt-for-u-alice"),
+            json!({ "key_id": "key-2", "previous_key_id": "key-others" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["key_id"], "key-3");
+    assert!(h.mock.lock().unwrap().deleted.is_empty());
+
+    // And Alice's own previous key is deleted, never the one being replaced.
+    set_key_expiry(&h, "key-3", 5);
+    let (status, body) = h
+        .post_json(
+            "/api/auth/sso/renew",
+            Some("jwt-for-u-alice"),
+            json!({ "key_id": "key-3", "previous_key_id": "key-2" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["key_id"], "key-4");
+    assert_eq!(h.mock.lock().unwrap().deleted, vec!["key-2".to_string()]);
+
+    // Naming the current key as "previous" deletes nothing.
+    set_key_expiry(&h, "key-4", 5);
+    let (status, _) = h
+        .post_json(
+            "/api/auth/sso/renew",
+            Some("jwt-for-u-alice"),
+            json!({ "key_id": "key-4", "previous_key_id": "key-4" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.mock.lock().unwrap().deleted, vec!["key-2".to_string()]);
+}
+
+#[tokio::test]
+async fn renew_leaves_a_key_that_is_not_due_alone() {
+    let h = harness().await;
+    let (id, _) = h.start_login().await;
+    h.post_acs(Some(&id), &h.idp.signed_response(&id, "alice"))
+        .await;
+    set_key_expiry(&h, "key-1", 11);
+
+    let (status, _) = h
+        .post_json(
+            "/api/auth/sso/renew",
+            Some("jwt-for-u-alice"),
+            json!({ "key_id": "key-1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let m = h.mock.lock().unwrap();
+    assert_eq!(m.created.len(), 1, "no new key");
+    assert!(m.deleted.is_empty());
+}
+
+#[tokio::test]
+async fn renew_only_ever_replaces_the_callers_own_sso_key() {
+    let h = harness().await;
+    let (id, _) = h.start_login().await;
+    h.post_acs(Some(&id), &h.idp.signed_response(&id, "alice"))
+        .await;
+    set_key_expiry(&h, "key-1", 1);
+    // A key of Alice's that this server didn't mint.
+    h.mock.lock().unwrap().keys.push(json!({
+        "id": "key-hers", "name": "my-script", "userId": "u-alice",
+        "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+    }));
+
+    let cases = [
+        // Someone else's valid token, naming Alice's key.
+        (Some("jwt-for-other"), "key-1", StatusCode::NOT_FOUND),
+        // Alice's own token, but a key that isn't an SSO key.
+        (Some("jwt-for-u-alice"), "key-hers", StatusCode::NOT_FOUND),
+        // A key that doesn't exist.
+        (Some("jwt-for-u-alice"), "key-99", StatusCode::NOT_FOUND),
+        // No token, or one ABS refuses: the page must sign in again.
+        (None, "key-1", StatusCode::UNAUTHORIZED),
+        (Some("expired-token"), "key-1", StatusCode::UNAUTHORIZED),
+        // ABS failing is not a refusal: the sign-in may be fine.
+        (Some("abs-is-down"), "key-1", StatusCode::BAD_GATEWAY),
+    ];
+    for (bearer, key_id, want) in cases {
+        let (status, _) = h
+            .post_json("/api/auth/sso/renew", bearer, json!({ "key_id": key_id }))
+            .await;
+        assert_eq!(status, want, "bearer {bearer:?}, key {key_id}");
+    }
+    let m = h.mock.lock().unwrap();
+    assert_eq!(m.created.len(), 1, "no key was minted");
+    assert!(m.deleted.is_empty(), "no key was deleted");
 }
 
 #[tokio::test]

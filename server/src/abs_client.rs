@@ -3,6 +3,14 @@ use reqwest::{Client, header};
 
 use crate::models::{AbsApiKey, AbsApiKeyCreated, AbsLoginResponse, AbsMeResponse, AbsUserSummary};
 
+/// True when ABS answered 401 or 403, i.e. it refused the token itself (expired,
+/// deleted or never valid), as opposed to ABS being unreachable or erroring.
+pub fn is_auth_refusal(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<reqwest::Error>()
+        .and_then(|e| e.status())
+        .is_some_and(|s| s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN)
+}
+
 pub struct AbsClient {
     client: Client,
     base_url: String,
