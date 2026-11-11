@@ -4,9 +4,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::abs_client::AbsClient;
+use crate::abs_client::{is_auth_refusal, AbsClient};
 use crate::hub::{self};
-use crate::models::{AbsMeResponse, ClientMessage, ItemInfo, ServerMessage};
+use crate::models::{is_abs_id, AbsMeResponse, ClientMessage, ItemInfo, ServerMessage};
 use crate::room::Participant;
 use crate::AppState;
 
@@ -51,7 +51,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
             ClientMessage::Join { room_id, abs_token } => {
                 let me = match validate_token(&state.abs, &abs_token, state.config.bypass_auth).await {
                     Ok(m) => m,
-                    Err(e) => { let _ = tx.send(ServerMessage::Error { message: e }); continue; }
+                    Err(m) => { let _ = tx.send(m); continue; }
                 };
 
                 let rid = match room_id {
@@ -70,13 +70,23 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
 
-            ClientMessage::CreateRoom { room_id, abs_token, item_id, item_title, item_author, library_id } => {
+            ClientMessage::CreateRoom { room_id, abs_token, item_id, item_title, item_author, library_id, episode_id } => {
+                // Every guest's browser puts these ids into its relay calls,
+                // so a host can't hand them anything but plain ABS ids.
+                let ids_ok = is_abs_id(&item_id)
+                    && is_abs_id(&library_id)
+                    && episode_id.as_deref().map_or(true, is_abs_id);
+                if !ids_ok {
+                    let _ = tx.send(ServerMessage::Error { message: "Invalid item or episode id".into() });
+                    continue;
+                }
+
                 let me = match validate_token(&state.abs, &abs_token, state.config.bypass_auth).await {
                     Ok(m) => m,
-                    Err(e) => { let _ = tx.send(ServerMessage::Error { message: e }); continue; }
+                    Err(m) => { let _ = tx.send(m); continue; }
                 };
 
-                let item = ItemInfo { id: item_id, library_id, title: item_title, author: item_author };
+                let item = ItemInfo { id: item_id, library_id, episode_id, title: item_title, author: item_author };
                 let participant = Participant { id: participant_id, name: me.username.clone(), abs_token, abs_username: me.username, tx: tx.clone() };
 
                 match hub::create_room(&state.rooms, room_id.clone(), item, participant).await {
@@ -134,13 +144,28 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 }
 
+/// Asks ABS who the token belongs to. On failure, returns the message to send:
+/// `auth_failed` when ABS refused the token (the page then asks the person to sign
+/// in again), a plain `error` when ABS could not be asked at all (the sign-in may
+/// be fine, so the page must not throw it away).
 async fn validate_token(
     abs: &Arc<AbsClient>,
     token: &str,
     bypass: bool,
-) -> Result<AbsMeResponse, String> {
+) -> Result<AbsMeResponse, ServerMessage> {
     if bypass {
         return Ok(AbsMeResponse { id: token.into(), username: token.into() });
     }
-    abs.me(token).await.map_err(|_| "ABS token validation failed".into())
+    abs.me(token).await.map_err(|e| {
+        if is_auth_refusal(&e) {
+            ServerMessage::AuthFailed {
+                message: "Your sign-in has run out. Please sign in again.".into(),
+            }
+        } else {
+            tracing::warn!("Checking a token with ABS failed: {e:#}");
+            ServerMessage::Error {
+                message: "Audiobookshelf could not be reached. Try again in a minute.".into(),
+            }
+        }
+    })
 }

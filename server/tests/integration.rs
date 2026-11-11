@@ -232,3 +232,140 @@ async fn websocket_play_intent_and_ready_triggers_play() {
     assert_eq!(guest_play["type"], "play");
     assert!((guest_play["position"].as_f64().unwrap() - 75.5).abs() < f64::EPSILON);
 }
+
+// --- Podcast episodes ---
+
+#[tokio::test]
+async fn websocket_episode_room_tells_guests_the_episode() {
+    let addr = spawn_test_server().await;
+
+    let (mut host_ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+    host_ws
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "create_room",
+                "room_id": "pod12345",
+                "abs_token": "alice",
+                "item_id": "li_podcast1",
+                "item_title": "Episode 7",
+                "item_author": "Some Show",
+                "library_id": "lib_pods",
+                "episode_id": "ep_seven"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&host_ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(state["type"], "room_state");
+    assert_eq!(state["item"]["episode_id"], "ep_seven");
+
+    let (mut guest_ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+    guest_ws
+        .send(Message::Text(
+            serde_json::json!({ "type": "join", "room_id": "pod12345", "abs_token": "bob" }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let guest_state: serde_json::Value =
+        serde_json::from_str(&guest_ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(guest_state["item"]["id"], "li_podcast1");
+    assert_eq!(guest_state["item"]["episode_id"], "ep_seven");
+}
+
+#[tokio::test]
+async fn websocket_create_room_refuses_ids_that_are_not_plain() {
+    let addr = spawn_test_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+
+    for (item_id, episode_id) in [("../users", None), ("li_1", Some("ep/../../users")), ("li_1", Some("%2e%2e"))] {
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "create_room",
+                "room_id": "bad12345",
+                "abs_token": "alice",
+                "item_id": item_id,
+                "item_title": "T",
+                "item_author": "A",
+                "library_id": "lib_1",
+                "episode_id": episode_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(reply["type"], "error", "{item_id} / {episode_id:?} should be refused");
+    }
+}
+
+async fn proxy_status(method: &str, uri: &str) -> StatusCode {
+    build_app(test_config())
+        .oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn proxy_lets_episode_paths_through_to_the_token_check() {
+    // No Bearer token: an allowed path stops at 401, a refused one at 403.
+    assert_eq!(proxy_status("POST", "/api/abs-proxy/api/items/li_1/play/ep_1").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(proxy_status("GET", "/api/abs-proxy/api/libraries/lib_1/recent-episodes?limit=40&page=0").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(proxy_status("GET", "/api/abs-proxy/api/me/progress/li_1/ep_1").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(proxy_status("POST", "/api/abs-proxy/api/items/li_1/play/ep_1/x").await, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn proxy_refuses_double_encoded_dots() {
+    assert_eq!(
+        proxy_status("GET", "/api/abs-proxy/api/items/x/%252e%252e/%252e%252e/users").await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// A WS server that really checks tokens with an ABS at `abs_base_url`.
+async fn spawn_checking_server(abs_base_url: String) -> std::net::SocketAddr {
+    let mut cfg = test_config();
+    cfg.bypass_auth = false;
+    cfg.abs_base_url = abs_base_url;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_app(cfg);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+async fn join_reply(addr: std::net::SocketAddr, token: &str) -> serde_json::Value {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+    ws.send(Message::Text(
+        serde_json::json!({ "type": "join", "room_id": "abc12345", "abs_token": token }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn websocket_tells_a_refused_token_apart_from_abs_being_down() {
+    // A stand-in ABS that refuses every token, like one whose key has run out.
+    let abs = axum::Router::new().route(
+        "/api/me",
+        axum::routing::get(|| async { StatusCode::UNAUTHORIZED }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let abs_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, abs).await.unwrap() });
+
+    let refused = join_reply(spawn_checking_server(format!("http://{abs_addr}")).await, "old-key").await;
+    assert_eq!(refused["type"], "auth_failed", "{refused}");
+
+    // Nothing listens on port 9 here: ABS can't be reached, so the token may be fine.
+    let down = join_reply(spawn_checking_server("http://127.0.0.1:9".into()).await, "old-key").await;
+    assert_eq!(down["type"], "error", "{down}");
+    assert!(down["message"].as_str().unwrap().contains("could not be reached"), "{down}");
+}

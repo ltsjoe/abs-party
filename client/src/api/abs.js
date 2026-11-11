@@ -4,6 +4,10 @@
 
 const PROXY = '/api/abs-proxy'
 
+// Ids go into URL paths. Encode them, so a stray "/" or "?" in one can't turn
+// the call into a different ABS path. (Real ABS ids never need it.)
+const seg = encodeURIComponent
+
 function authHeaders(token) {
   return { Authorization: `Bearer ${token}` }
 }
@@ -38,6 +42,26 @@ export async function ssoLogout(token, keyId) {
   })
 }
 
+// Asks the party server to swap this SSO key for a fresh one (see renew in
+// server/src/saml.rs). Resolves to { status, grant }: 200 with a new grant,
+// 204 not due yet, 401 the sign-in is dead, 404 not an SSO key, anything else
+// means it couldn't check. Throws only when the request fails outright.
+export async function renewSso(token, keyId, previousKeyId = '', signal = undefined) {
+  const resp = await fetch('/api/auth/sso/renew', {
+    method: 'POST',
+    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key_id: keyId, previous_key_id: previousKeyId || null }),
+    signal,
+  })
+  return { status: resp.status, grant: resp.status === 200 ? await resp.json() : null }
+}
+
+// The status ABS answers for this token (200: it works; 401: refused).
+export async function tokenStatus(token, signal = undefined) {
+  const resp = await fetch(`${PROXY}/api/me`, { headers: authHeaders(token), signal })
+  return resp.status
+}
+
 export async function getMe(_absBase, token) {
   const resp = await fetch(`${PROXY}/api/me`, { headers: authHeaders(token) })
   if (!resp.ok) throw new Error('Failed to fetch user')
@@ -50,11 +74,14 @@ export async function getLibraries(_absBase, token) {
   return resp.json()
 }
 
+// The items of a library: books in a book library, podcasts in a podcast
+// library. (ABS picks by the library's own type and ignores a mediaType
+// parameter, checked in LibraryController.getLibraryItems, ABS 2.37.2.)
 export async function getLibraryItems(_absBase, token, libraryId, page = 0, sort = 'progress', desc = true) {
-  const params = new URLSearchParams({ limit: 40, page, mediaType: 'book' })
+  const params = new URLSearchParams({ limit: 40, page })
   if (sort) { params.set('sort', sort); params.set('desc', desc ? 1 : 0) }
   const resp = await fetch(
-    `${PROXY}/api/libraries/${libraryId}/items?${params}`,
+    `${PROXY}/api/libraries/${seg(libraryId)}/items?${params}`,
     { headers: authHeaders(token) }
   )
   if (!resp.ok) throw new Error('Failed to fetch items')
@@ -63,20 +90,37 @@ export async function getLibraryItems(_absBase, token, libraryId, page = 0, sort
 
 export async function searchLibraryItems(_absBase, token, libraryId, query) {
   const params = new URLSearchParams({ q: query, limit: 40 })
-  const resp = await fetch(`${PROXY}/api/libraries/${libraryId}/search?${params}`, { headers: authHeaders(token) })
+  const resp = await fetch(`${PROXY}/api/libraries/${seg(libraryId)}/search?${params}`, { headers: authHeaders(token) })
   if (!resp.ok) throw new Error('Search failed')
   const data = await resp.json()
-  return (data.book || []).map(b => b.libraryItem)
+  // ABS answers `book` matches in a book library, `podcast` in a podcast one.
+  return (data.book || data.podcast || []).map(b => b.libraryItem)
 }
 
+// Newest episodes across a podcast library, skipping ones this user finished.
+// ABS returns no total, so a full page (`limit`) means there may be more.
+export async function getRecentEpisodes(_absBase, token, libraryId, page = 0, limit = 40) {
+  const params = new URLSearchParams({ limit, page })
+  const resp = await fetch(
+    `${PROXY}/api/libraries/${seg(libraryId)}/recent-episodes?${params}`,
+    { headers: authHeaders(token) }
+  )
+  if (!resp.ok) throw new Error('Failed to fetch episodes')
+  const data = await resp.json()
+  return data.episodes || []
+}
+
+// A podcast's item comes back with all its episodes in media.episodes.
 export async function getItem(_absBase, token, itemId) {
-  const resp = await fetch(`${PROXY}/api/items/${itemId}?expanded=1`, { headers: authHeaders(token) })
+  const resp = await fetch(`${PROXY}/api/items/${seg(itemId)}?expanded=1`, { headers: authHeaders(token) })
   if (!resp.ok) throw new Error('Failed to fetch item')
   return resp.json()
 }
 
-export async function getProgress(_absBase, token, libraryItemId) {
-  const resp = await fetch(`${PROXY}/api/me/progress/${libraryItemId}`, { headers: authHeaders(token) })
+// ABS keeps progress per book, and per episode in a podcast.
+export async function getProgress(_absBase, token, libraryItemId, episodeId = null) {
+  const path = episodeId ? `${seg(libraryItemId)}/${seg(episodeId)}` : seg(libraryItemId)
+  const resp = await fetch(`${PROXY}/api/me/progress/${path}`, { headers: authHeaders(token) })
   if (resp.status === 404) return null
   if (!resp.ok) throw new Error('Failed to fetch progress')
   return resp.json()
@@ -88,7 +132,7 @@ export async function getBookmarks(_absBase, token, libraryItemId) {
 }
 
 export async function createBookmark(_absBase, token, libraryItemId, time, title) {
-  const resp = await fetch(`${PROXY}/api/me/item/${libraryItemId}/bookmark`, {
+  const resp = await fetch(`${PROXY}/api/me/item/${seg(libraryItemId)}/bookmark`, {
     method: 'POST',
     headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify({ time, title }),
@@ -97,8 +141,11 @@ export async function createBookmark(_absBase, token, libraryItemId, time, title
   return resp.json()
 }
 
-export async function startPlaybackSession(_absBase, token, libraryItemId) {
-  const resp = await fetch(`${PROXY}/api/items/${libraryItemId}/play`, {
+// A book plays as a whole item; a podcast plays one episode at a time
+// (POST /api/items/:id/play/:episodeId; a podcast without one is a 404).
+export async function startPlaybackSession(_absBase, token, libraryItemId, episodeId = null) {
+  const path = episodeId ? `${seg(libraryItemId)}/play/${seg(episodeId)}` : `${seg(libraryItemId)}/play`
+  const resp = await fetch(`${PROXY}/api/items/${path}`, {
     method: 'POST',
     headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify({

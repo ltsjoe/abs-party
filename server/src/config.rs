@@ -102,7 +102,7 @@ impl SamlConfig {
             .expect("ABS_ADMIN_API_KEY or ABS_ADMIN_API_KEY_FILE is required when SAML is enabled");
         let key_ttl_hours: u64 = env::var("SSO_KEY_TTL_HOURS")
             .map(|v| v.parse().expect("SSO_KEY_TTL_HOURS must be a whole number"))
-            .unwrap_or(12);
+            .unwrap_or(2160); // 90 days; the page renews a key on any day it is used
         assert!(key_ttl_hours > 0, "SSO_KEY_TTL_HOURS must be at least 1");
         Some(Self {
             entity_id: env::var("SAML_SP_ENTITY_ID")

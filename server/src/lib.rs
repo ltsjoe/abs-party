@@ -76,7 +76,8 @@ pub fn build_app_with_saml(config: Config, saml: Option<Arc<Saml>>) -> Router {
             .route("/auth/saml/acs", post(saml::acs))
             .route("/auth/saml/metadata", get(saml::metadata))
             .route("/api/auth/sso/redeem", post(saml::redeem))
-            .route("/api/auth/sso/logout", post(saml::logout));
+            .route("/api/auth/sso/logout", post(saml::logout))
+            .route("/api/auth/sso/renew", post(saml::renew));
     }
 
     router
@@ -190,17 +191,28 @@ fn proxy_path_allowed(method: &Method, path: &str) -> bool {
     if path.contains("..") {
         return false;
     }
+    // axum has already percent-decoded the path once, so a `%` here means the
+    // caller double-encoded something: "%252e%252e" arrives as "%2e%2e", and
+    // the URL parser for the ABS request turns that back into "..", which got
+    // past the check above. No ABS route or id has a `%` in it.
+    if path.contains('%') {
+        return false;
+    }
     match method.as_str() {
         "GET" => matches_any(path, &[
             "api/me",
             "api/libraries",
         ]) || path_matches_prefix_suffix(path, "api/libraries/", "/items")
           || path_matches_prefix_suffix(path, "api/libraries/", "/search")
+          // newest podcast episodes across a podcast library
+          || path_matches_segments(path, &["api", "libraries", ID, "recent-episodes"])
           || path.starts_with("api/items/")   // item detail + cover
           || path.starts_with("api/me/progress/"),
         "POST" => {
             (path.starts_with("api/me/item/") && path.ends_with("/bookmark"))
                 || (path.starts_with("api/items/") && path.ends_with("/play"))
+                // play one podcast episode
+                || path_matches_segments(path, &["api", "items", ID, "play", ID])
                 || (path.starts_with("api/session/")
                     && (path.ends_with("/sync") || path.ends_with("/close")))
         }
@@ -214,6 +226,23 @@ fn matches_any(path: &str, exact: &[&str]) -> bool {
 
 fn path_matches_prefix_suffix(path: &str, prefix: &str, suffix: &str) -> bool {
     path.starts_with(prefix) && path.ends_with(suffix)
+}
+
+/// Stands for one ABS id in a `path_matches_segments` pattern.
+const ID: &str = "{id}";
+
+/// True when `path` has exactly the pattern's segments, no more and no fewer,
+/// and each `ID` segment is a plain ABS id (`models::is_abs_id`).
+fn path_matches_segments(path: &str, pattern: &[&str]) -> bool {
+    let mut segments = path.split('/');
+    for &want in pattern {
+        match segments.next() {
+            Some(seg) if want == ID && models::is_abs_id(seg) => {}
+            Some(seg) if want != ID && seg == want => {}
+            _ => return false,
+        }
+    }
+    segments.next().is_none()
 }
 
 async fn abs_proxy(
@@ -260,5 +289,63 @@ async fn abs_proxy(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ITEM: &str = "0b1c2d3e-aaaa-4bbb-8ccc-1234567890ab";
+    const EPISODE: &str = "ep_lh6ko39pumnrma3dhv";
+
+    #[test]
+    fn book_play_still_allowed() {
+        assert!(proxy_path_allowed(&Method::POST, &format!("api/items/{ITEM}/play")));
+    }
+
+    #[test]
+    fn episode_play_allowed() {
+        assert!(proxy_path_allowed(&Method::POST, &format!("api/items/{ITEM}/play/{EPISODE}")));
+    }
+
+    #[test]
+    fn episode_play_needs_exactly_two_plain_ids() {
+        for path in [
+            format!("api/items/{ITEM}/play/"),
+            format!("api/items/{ITEM}/play/{EPISODE}/extra"),
+            format!("api/items/{ITEM}/play/ep.1"),
+            format!("api/items//play/{EPISODE}"),
+            format!("api/items/{ITEM}/x/play/{EPISODE}"),
+        ] {
+            assert!(!proxy_path_allowed(&Method::POST, &path), "{path} should be refused");
+        }
+    }
+
+    #[test]
+    fn recent_episodes_is_get_only_with_one_library_id() {
+        assert!(proxy_path_allowed(&Method::GET, "api/libraries/lib_1/recent-episodes"));
+        assert!(!proxy_path_allowed(&Method::POST, "api/libraries/lib_1/recent-episodes"));
+        assert!(!proxy_path_allowed(&Method::GET, "api/libraries/a/b/recent-episodes"));
+        assert!(!proxy_path_allowed(&Method::GET, "api/libraries//recent-episodes"));
+    }
+
+    #[test]
+    fn episode_progress_allowed() {
+        assert!(proxy_path_allowed(&Method::GET, &format!("api/me/progress/{ITEM}/{EPISODE}")));
+    }
+
+    #[test]
+    fn double_encoded_dots_refused() {
+        // What axum hands over for /api/abs-proxy/api/items/x/%252e%252e/%252e%252e/users
+        assert!(!proxy_path_allowed(&Method::GET, "api/items/x/%2e%2e/%2e%2e/users"));
+        assert!(!proxy_path_allowed(&Method::POST, "api/items/x/%2e%2e/play"));
+    }
+
+    #[test]
+    fn writes_and_deletes_still_blocked() {
+        assert!(!proxy_path_allowed(&Method::DELETE, &format!("api/items/{ITEM}")));
+        assert!(!proxy_path_allowed(&Method::PATCH, &format!("api/me/progress/{ITEM}/{EPISODE}")));
+        assert!(!proxy_path_allowed(&Method::POST, "api/users"));
     }
 }

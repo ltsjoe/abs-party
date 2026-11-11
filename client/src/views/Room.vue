@@ -25,7 +25,12 @@
         <!-- Player -->
         <div class="player-area">
           <div v-if="bookmarkSaved" class="notice">
-            ✅ Bookmark saved at your previous position — you can restore it from the ABS bookmarks panel.
+            <template v-if="roomEpisodeLabel">
+              ✅ Bookmark saved at your previous position in this episode — it's in the Bookmarks list here.
+            </template>
+            <template v-else>
+              ✅ Bookmark saved at your previous position — you can restore it from the ABS bookmarks panel.
+            </template>
           </div>
           <div v-if="preparing" class="status">Opening playback session…</div>
 
@@ -54,13 +59,22 @@
               <span class="time">{{ fmt(player.duration.value) }}</span>
             </div>
 
+            <!-- Chapter playing now (only when there are chapters to pick from) -->
+            <div v-if="hasChapters" class="chapter-now">
+              <span class="chapter-now-title">{{ currentChapter?.title || 'Before the first chapter' }}</span>
+              <span v-if="currentChapter" class="chapter-now-count">{{ currentChapterIndex + 1 }} / {{ chapters.length }}</span>
+            </div>
+
             <!-- Controls -->
             <div class="controls">
+              <button v-if="hasChapters" class="ctrl-btn" title="Previous chapter" aria-label="Previous chapter" @click="prevChapter">⏮</button>
               <button class="ctrl-btn" @click="skip(-10)">-10s</button>
               <button class="ctrl-btn play-btn" :class="{ buffering: buffering }" @click="togglePlay">
                 {{ buffering ? '⏳' : player.isPlaying.value ? '⏸' : '▶' }}
               </button>
               <button class="ctrl-btn" @click="skip(10)">+10s</button>
+              <button v-if="hasChapters" class="ctrl-btn" title="Next chapter" aria-label="Next chapter"
+                      :disabled="nextChapterAt === null" @click="nextChapter">⏭</button>
             </div>
             <div v-if="buffering" class="buffering-notice">Buffering…</div>
 
@@ -74,6 +88,22 @@
                   @input="e => player.setVolume(Number(e.target.value))"
                 />
               </label>
+            </div>
+
+            <!-- Chapter list: pick one to jump there (for everyone, like any seek) -->
+            <div v-if="hasChapters" class="chapters">
+              <h3>Chapters</h3>
+              <ol ref="chapterListEl" class="chapter-list">
+                <li v-for="(c, i) in chapters" :key="c.id ?? i">
+                  <button type="button" class="chapter-item"
+                          :class="{ current: i === currentChapterIndex }"
+                          :aria-current="i === currentChapterIndex ? 'true' : null"
+                          @click="seekToChapter(c)">
+                    <span class="chapter-title">{{ c.title }}</span>
+                    <span class="chapter-time">{{ fmt(c.start) }}</span>
+                  </button>
+                </li>
+              </ol>
             </div>
           </div>
         </div>
@@ -99,6 +129,7 @@
             />
             <button class="btn-bookmark-add" @click="addBookmark">Add</button>
           </div>
+          <p v-if="bookmarkHint" class="bookmark-hint">{{ bookmarkHint }}</p>
           <ul class="bookmark-list">
             <li v-for="b in bookmarks" :key="b.time"
                 class="bookmark-item bookmark-seekable"
@@ -123,7 +154,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, inject, onMounted, onUnmounted, watch, watchEffect } from 'vue'
+import { ref, reactive, computed, inject, onMounted, onUnmounted, watch, watchEffect, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useWebSocket } from '../composables/useWebSocket.js'
 import { useAbsPlayer } from '../composables/useAbsPlayer.js'
@@ -132,11 +163,15 @@ import { getBookmarks, createBookmark } from '../api/abs.js'
 import { useEventLog } from '../composables/useEventLog.js'
 import { useAudioCues } from '../composables/useAudioCues.js'
 import { shortenTitle } from '../utils/title.js'
+import { episodeLabel, episodeBookmarkTitle, bookmarksForRoom, canBookmarkAt } from '../utils/bookmarks.js'
+import { rememberRoom } from '../utils/session.js'
+import { chapterIndexAt, prevChapterStart, nextChapterStart } from '../utils/chapters.js'
 
 const route = useRoute()
 const router = useRouter()
 const auth = inject('auth')
 const absBase = inject('ABS_BASE')
+const signInExpired = inject('signInExpired')
 
 const roomId = ref(route.params.id)
 const isHostMode = route.query.host === 'true'  // constant: this tab intends to act as room creator
@@ -149,8 +184,12 @@ const buffering = ref(false)
 const participants = ref([])
 const bookmarks = ref([])
 const newBookmarkTitle = ref('')
+const bookmarkHint = ref('')
+let bookmarkHintTimer = null
 const roomState = reactive({ item: null, position: 0, playing: false, speed: 1 })
 const isHost = ref(isHostMode)
+// '' in a book room; in a podcast room, the episode name its bookmarks carry.
+const roomEpisodeLabel = computed(() => episodeLabel(roomState.item))
 
 
 const previousTitle = document.title
@@ -198,14 +237,15 @@ watch(connected, (val, old) => {
 
 onMounted(async () => {
   if (!auth.token) {
-    // Come back here after signing in (Home.vue reads this).
-    try { sessionStorage.setItem('abs_party_return', route.fullPath) } catch { /* storage unavailable */ }
-    fatalError.value = 'You must be signed in to join a room.'
+    // Opened a shared link while signed out: sign in first, then come straight
+    // back here (Home.vue reads the remembered room).
+    rememberRoom(route.fullPath)
+    router.replace({ path: '/', query: { signin: 'join' } })
     return
   }
 
   if (isHostMode && !route.query.itemId) {
-    fatalError.value = 'No book selected. Please go back and pick a book from the library first.'
+    fatalError.value = 'Nothing selected. Please go back and pick a book or an episode from the library first.'
     return
   }
 
@@ -235,6 +275,7 @@ onMounted(async () => {
       item_title: route.query.title,
       item_author: route.query.author,
       library_id: route.query.libraryId,
+      episode_id: route.query.episodeId || null,
     })
   } else {
     send({
@@ -260,8 +301,11 @@ async function handleMessage(msg) {
     if (preparing.value && auth.token && roomState.item?.id) {
       preparing.value = false
       try {
-        const session = await player.open(auth.token, roomState.item.id)
-        bookmarkSaved.value = true
+        const session = await player.open(auth.token, roomState.item.id, {
+          episodeId: roomState.item.episode_id || null,
+          episodeLabel: roomEpisodeLabel.value,
+        })
+        bookmarkSaved.value = player.preJoinBookmarkSaved.value
         setTimeout(() => { bookmarkSaved.value = false }, 5000)
         await loadBookmarks()
         if (isHostMode) {
@@ -306,6 +350,11 @@ async function handleMessage(msg) {
   if (msg.type === 'host_changed') {
     participants.value = participants.value.map(p => ({ ...p, is_host: p.name === msg.name }))
     isHost.value = msg.name === displayName.value
+    return
+  }
+  if (msg.type === 'auth_failed') {
+    // ABS refused our token: sign in again and come back to this room.
+    signInExpired()
     return
   }
   if (msg.type === 'error') {
@@ -364,6 +413,7 @@ function rejoinRoom() {
       item_title: roomState.item.title,
       item_author: roomState.item.author,
       library_id: roomState.item.library_id,
+      episode_id: roomState.item.episode_id || null,
     })
   } else if (roomId.value) {
     send({ type: 'join', room_id: roomId.value, abs_token: auth.token })
@@ -396,17 +446,66 @@ function skip(seconds) {
   addEvent(`You seeked to ${fmt(pos)}`, 'normal')
 }
 
+// --- Chapters ---
+const chapters = computed(() => player.chapters.value)
+// A list with one chapter has nothing to pick, so it isn't shown.
+const hasChapters = computed(() => chapters.value.length > 1)
+const currentChapterIndex = computed(() => chapterIndexAt(chapters.value, player.currentTime.value))
+const currentChapter = computed(() => chapters.value[currentChapterIndex.value] ?? null)
+const nextChapterAt = computed(() => nextChapterStart(chapters.value, player.currentTime.value))
+const chapterListEl = ref(null)
+
+// Seek here and take the room along (the same message as dragging the bar).
+function seekRoom(pos) {
+  player.seekTo(pos)
+  send({ type: 'seek', position: pos })
+  addEvent(`You seeked to ${fmt(pos)}`, 'normal')
+}
+
+function seekToChapter(c) {
+  seekRoom(c.start)
+}
+
+function prevChapter() {
+  seekRoom(prevChapterStart(chapters.value, player.currentTime.value))
+}
+
+function nextChapter() {
+  if (nextChapterAt.value !== null) seekRoom(nextChapterAt.value)
+}
+
+// Keep the chapter playing in view inside the list, without scrolling the page.
+watch(currentChapterIndex, async () => {
+  await nextTick()
+  const list = chapterListEl.value
+  const item = list?.querySelector('[aria-current="true"]')
+  if (!list || !item) return
+  const top = item.offsetTop
+  const bottom = top + item.offsetHeight
+  if (top < list.scrollTop || bottom > list.scrollTop + list.clientHeight) {
+    list.scrollTop = top - (list.clientHeight - item.offsetHeight) / 2
+  }
+})
+
 function seekToBookmark(b) {
   player.seekTo(b.time)
   send({ type: 'seek', position: b.time })
   addEvent(`You seeked to ${fmt(b.time)}`, 'normal')
 }
 
+function showBookmarkHint(text) {
+  clearTimeout(bookmarkHintTimer)
+  bookmarkHint.value = text
+  if (text) bookmarkHintTimer = setTimeout(() => { bookmarkHint.value = '' }, 6000)
+}
+
 async function loadBookmarks() {
   if (!roomState.item?.id) return
   try {
     const data = await getBookmarks(null, auth.token, roomState.item.id)
-    bookmarks.value = Array.isArray(data) ? data.sort((a, b) => b.time - a.time) : []
+    // A podcast's bookmarks cover all its episodes: keep this episode's only.
+    const mine = Array.isArray(data) ? bookmarksForRoom(data, roomEpisodeLabel.value) : []
+    bookmarks.value = mine.sort((a, b) => b.time - a.time)
   } catch (e) {
     console.warn('Failed to load bookmarks:', e)
   }
@@ -415,10 +514,17 @@ async function loadBookmarks() {
 async function addBookmark() {
   if (!roomState.item?.id) return
   const time = player.currentTime.value
+  // At 0:00 an episode bookmark would rename another episode's (utils/bookmarks.js).
+  if (!canBookmarkAt(roomEpisodeLabel.value, time)) {
+    showBookmarkHint("A bookmark can't go at 0:00 in an episode. Play a moment first, then add it.")
+    return
+  }
+  showBookmarkHint('')
   const ts = new Date().toISOString().slice(0, 19)
   const title = newBookmarkTitle.value.trim() || ts
   try {
-    await createBookmark(null, auth.token, roomState.item.id, time, title)
+    await createBookmark(null, auth.token, roomState.item.id, time,
+      episodeBookmarkTitle(title, roomEpisodeLabel.value))
     newBookmarkTitle.value = ''
     await loadBookmarks()
   } catch (e) {
@@ -470,7 +576,29 @@ function fmt(s) {
 .progress { flex: 1; accent-color: #6c5ce7; }
 .time { font-size: 0.8rem; color: #888; white-space: nowrap; min-width: 45px; }
 
-.controls { display: flex; gap: 1rem; align-items: center; }
+.controls { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; justify-content: center; }
+.chapter-now { display: flex; gap: 0.5rem; align-items: baseline; justify-content: center; max-width: 100%; font-size: 0.9rem; color: #ccc; }
+.chapter-now-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chapter-now-count { color: #888; font-size: 0.8rem; flex-shrink: 0; }
+.chapters { width: 100%; }
+.chapters h3 { margin: 0 0 0.5rem; font-size: 0.85rem; color: #aaa; text-transform: uppercase; letter-spacing: 0.05em; }
+.chapter-list { position: relative; list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y: auto; border: 1px solid #0f3460; border-radius: 8px; }
+.chapter-item { display: flex; justify-content: space-between; gap: 0.75rem; width: 100%; padding: 0.5rem 0.75rem; background: none; border: none; border-bottom: 1px solid #0f3460; color: #ccc; font-size: 0.85rem; text-align: left; cursor: pointer; }
+.chapter-list li:last-child .chapter-item { border-bottom: none; }
+.chapter-item:hover { background: #16213e; }
+.chapter-item.current { background: #0f3460; color: #fff; font-weight: 600; }
+.chapter-time { color: #888; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.bookmark-hint { margin: 0.35rem 0 0; font-size: 0.75rem; color: #fdcb6e; }
+/* Phones: the sidebar goes under the player instead of beside it, and the
+   whole room scrolls as one page. */
+@media (max-width: 640px) {
+  .room-header { padding: 0.75rem 1rem; }
+  .room-body { flex-direction: column; overflow-y: auto; }
+  .player-area { flex: none; overflow: visible; padding: 1rem; }
+  .sidebar { width: auto; border-left: none; border-top: 1px solid #0f3460; overflow: visible; }
+  .controls { gap: 0.5rem; }
+  .ctrl-btn { padding: 0.6rem 0.8rem; }
+}
 .ctrl-btn { background: #16213e; border: 1px solid #0f3460; color: #ccc; padding: 0.6rem 1.2rem; border-radius: 8px; cursor: pointer; font-size: 0.9rem; }
 .ctrl-btn:disabled { opacity: 0.4; cursor: default; }
 .play-btn { font-size: 1.5rem; padding: 0.75rem 1.5rem; background: #6c5ce7; border-color: #6c5ce7; color: #fff; border-radius: 50%; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; }

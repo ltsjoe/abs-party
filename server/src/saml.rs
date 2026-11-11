@@ -31,8 +31,9 @@ use samael::{
 };
 
 use crate::{
-    abs_client::AbsClient,
+    abs_client::{is_auth_refusal, AbsClient},
     config::{IdpMetadataSource, SamlConfig},
+    models::AbsApiKey,
     AppState,
 };
 
@@ -45,6 +46,10 @@ const COOKIE: &str = "abs_party_saml";
 const PENDING_TTL: Duration = Duration::from_secs(600);
 /// How long the browser has to redeem the one-time code after the redirect back.
 const GRANT_TTL: Duration = Duration::from_secs(60);
+/// How long a renewal is remembered. Renewing the same key again within this
+/// time hands back the same new key instead of minting another, so the key that
+/// stays valid after a renewal can't be used to mint keys over and over.
+const RENEWED_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Cap on sign-ins in progress, so spamming /auth/saml/login can't eat memory.
 const MAX_PENDING: usize = 10_000;
 
@@ -60,6 +65,8 @@ pub struct Saml {
     pending: DashMap<String, Instant>,
     /// One-time code → minted ABS key, waiting for the browser to redeem it.
     grants: DashMap<String, (Instant, SsoGrant)>,
+    /// Renewed key id → the key that replaced it (see `RENEWED_TTL`).
+    renewed: DashMap<String, (Instant, SsoGrant)>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -164,6 +171,7 @@ impl Saml {
             cfg,
             pending: DashMap::new(),
             grants: DashMap::new(),
+            renewed: DashMap::new(),
         })
     }
 
@@ -171,6 +179,8 @@ impl Saml {
         self.pending.retain(|_, sent| sent.elapsed() < PENDING_TTL);
         self.grants
             .retain(|_, (made, _)| made.elapsed() < GRANT_TTL);
+        self.renewed
+            .retain(|_, (made, _)| made.elapsed() < RENEWED_TTL);
     }
 
     fn secure_cookie(&self) -> bool {
@@ -245,7 +255,7 @@ impl Saml {
                 );
                 SsoError::Abs
             })?;
-        tracing::info!("SAML: signed in {:?}, ABS key {}", user.username, key.id);
+        tracing::info!("SAML: issued ABS key {} for {:?}", key.id, user.username);
 
         // Expired keys stay in ABS (it only deactivates them), so tidy ours up now and then.
         let abs = abs.clone();
@@ -308,6 +318,38 @@ fn cookie_header(saml: &Saml, value: &str, max_age: u64) -> String {
         "SameSite=Lax"
     };
     format!("{COOKIE}={value}; Path=/auth/saml; Max-Age={max_age}; HttpOnly; {attrs}")
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+}
+
+/// Whether a key that expires at `expires_at` is due to be swapped for a fresh one.
+/// A key is renewed once it has used up a day of its life (half of it, for
+/// lifetimes under two days), so a page that is opened often doesn't mint a new
+/// key every time. A key that never expires is never due.
+fn renewal_due(
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ttl_secs: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(expires_at) = expires_at else {
+        return false;
+    };
+    let ttl = ttl_secs as i64;
+    let renew_after = (ttl / 2).min(86_400);
+    let left = (expires_at - now).num_seconds();
+    left < ttl - renew_after
+}
+
+/// The SSO key `id`, if this server minted it for the ABS user `user_id`.
+fn own_sso_key<'a>(keys: &'a [AbsApiKey], id: &str, user_id: &str) -> Option<&'a AbsApiKey> {
+    keys.iter().find(|k| {
+        k.id == id && k.name.starts_with(KEY_PREFIX) && k.user_id.as_deref() == Some(user_id)
+    })
 }
 
 fn not_enabled() -> Response {
@@ -479,11 +521,7 @@ pub async fn logout(
     let Some(saml) = state.saml.as_ref() else {
         return not_enabled();
     };
-    let Some(token) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-    else {
+    let Some(token) = bearer_token(&headers) else {
         return (StatusCode::UNAUTHORIZED, "Missing Bearer token").into_response();
     };
     let me = match state.abs.me(token).await {
@@ -517,6 +555,113 @@ pub async fn logout(
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(serde::Deserialize)]
+pub struct RenewBody {
+    key_id: String,
+    /// The key this one replaced at the last renewal, if any. It is deleted now
+    /// rather than at that renewal, so a tab still using it kept working.
+    #[serde(default)]
+    previous_key_id: Option<String>,
+}
+
+/// POST /api/auth/sso/renew: swap the caller's SSO key for a fresh one, so a
+/// sign-in that keeps being used never runs out. The page calls this each time it
+/// loads.
+///
+/// - `200` + a new grant (same shape as `/redeem`).
+/// - `204`: the key isn't due yet (see `renewal_due`); keep using it.
+/// - `401`: ABS refused the token, or the user may no longer sign in (disabled,
+///   gone, root). The page signs out and asks for a fresh sign-in.
+/// - `404`: `key_id` isn't an SSO key of the caller's. The token itself still
+///   works, so the page keeps it.
+/// - `502`: ABS could not be asked. Nothing changed; try again later.
+///
+/// The key being replaced is NOT deleted here: another tab of the same browser
+/// may be playing a room with it right now. The page sends it back as
+/// `previous_key_id` at the next renewal (a day later at the earliest), and it is
+/// deleted then. So each browser holds at most two keys, and a lost reply leaves
+/// the old key working.
+///
+/// Like logout, the Bearer token proves who is asking, and only keys this server
+/// minted for that same ABS user are replaced or deleted. The ABS user is looked
+/// up again, so a user disabled in ABS stops being renewed.
+pub async fn renew(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RenewBody>,
+) -> Response {
+    let Some(saml) = state.saml.as_ref() else {
+        return not_enabled();
+    };
+    let Some(token) = bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "Missing Bearer token").into_response();
+    };
+    let me = match state.abs.me(token).await {
+        Ok(me) => me,
+        Err(e) if is_auth_refusal(&e) => {
+            return (StatusCode::UNAUTHORIZED, "Token not accepted by ABS").into_response()
+        }
+        Err(e) => {
+            tracing::error!("SAML renew: asking ABS who the caller is failed: {e:#}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let admin = &saml.cfg.abs_admin_api_key;
+    let keys = match state.abs.list_api_keys(admin).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("SAML renew: listing ABS keys failed: {e:#}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let Some(old) = own_sso_key(&keys, &body.key_id, &me.id).cloned() else {
+        return (StatusCode::NOT_FOUND, "Not an SSO key of yours").into_response();
+    };
+    if !renewal_due(old.expires_at, saml.cfg.key_ttl_secs, chrono::Utc::now()) {
+        return no_store(StatusCode::NO_CONTENT.into_response());
+    }
+    // Renewed already (another tab, or a reply that got lost): same answer again.
+    saml.purge_expired();
+    if let Some(done) = saml.renewed.get(&old.id) {
+        return no_store(Json(done.1.clone()).into_response());
+    }
+
+    let grant = match saml.mint_key(&state.abs, &me.username).await {
+        Ok(g) => g,
+        Err(SsoError::Abs) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(e) => {
+            tracing::info!("SAML renew: refused {:?}: {e:?}", me.username);
+            return (
+                StatusCode::UNAUTHORIZED,
+                "This account may no longer sign in",
+            )
+                .into_response();
+        }
+    };
+    saml.renewed
+        .insert(old.id.clone(), (Instant::now(), grant.clone()));
+
+    // The key the current one replaced last time has had a day or more for any
+    // open tab to move on. If deleting it fails it still runs out on its own, and
+    // the expiry sweep removes it after that.
+    let previous = body.previous_key_id.as_deref().filter(|p| *p != old.id);
+    if let Some(prev) = previous.and_then(|p| own_sso_key(&keys, p, &me.id)) {
+        if let Err(e) = state.abs.delete_api_key(admin, &prev.id).await {
+            tracing::warn!(
+                "SAML renew: deleting the previous ABS key {} failed: {e:#}",
+                prev.id
+            );
+        }
+    }
+    tracing::info!(
+        "SAML: renewed {:?}'s sign-in, ABS key {} replaced by {}",
+        me.username,
+        old.id,
+        grant.key_id
+    );
+    no_store(Json(grant).into_response())
+}
+
 /// GET /auth/saml/metadata: SP metadata, for importing into the IdP.
 /// Written by hand because samael's generator insists on a logout URL, which this
 /// server does not implement.
@@ -548,4 +693,60 @@ fn xml_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renewal_due;
+    use chrono::{Duration, Utc};
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn a_fresh_90_day_key_is_not_renewed() {
+        let now = Utc::now();
+        let ttl = 90 * DAY;
+        assert!(!renewal_due(
+            Some(now + Duration::seconds(ttl as i64 - 60)),
+            ttl,
+            now
+        ));
+        assert!(!renewal_due(
+            Some(now + Duration::days(89) + Duration::hours(1)),
+            ttl,
+            now
+        ));
+    }
+
+    #[test]
+    fn a_90_day_key_is_renewed_after_a_day() {
+        let now = Utc::now();
+        let ttl = 90 * DAY;
+        assert!(renewal_due(
+            Some(now + Duration::days(89) - Duration::minutes(1)),
+            ttl,
+            now
+        ));
+        assert!(renewal_due(Some(now + Duration::days(3)), ttl, now));
+    }
+
+    #[test]
+    fn a_key_from_before_the_change_is_renewed_at_once() {
+        // Minted with the old 12-hour lifetime and still alive.
+        let now = Utc::now();
+        assert!(renewal_due(Some(now + Duration::hours(11)), 90 * DAY, now));
+    }
+
+    #[test]
+    fn short_lifetimes_renew_at_half_time() {
+        let now = Utc::now();
+        let ttl = 12 * 3600;
+        assert!(!renewal_due(Some(now + Duration::hours(7)), ttl, now));
+        assert!(renewal_due(Some(now + Duration::hours(5)), ttl, now));
+    }
+
+    #[test]
+    fn a_key_that_never_expires_is_left_alone() {
+        assert!(!renewal_due(None, 90 * DAY, Utc::now()));
+    }
 }

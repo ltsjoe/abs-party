@@ -6,6 +6,7 @@
 
       <template v-if="!auth.token">
         <h2>Sign in</h2>
+        <p v-if="notice" class="notice">{{ notice }}</p>
 
         <template v-if="loginOptions.saml">
           <a class="sso-button" href="/auth/saml/login" @click="loading = true">
@@ -49,6 +50,7 @@
 import { inject, ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { login, redeemSso } from '../api/abs.js'
+import { takeRememberedRoom, hasRememberedRoom } from '../utils/session.js'
 
 const router = useRouter()
 const route = useRoute()
@@ -65,6 +67,14 @@ const SSO_ERRORS = {
   root: 'The Audiobookshelf root account cannot use single sign-on. Use its password instead.',
   abs: 'Audiobookshelf could not be reached. Please try again later.',
 }
+
+// Why someone was sent here (App.vue and Room.vue add ?signin=...).
+const NOTICES = {
+  expired: 'Your sign-in had run out, so you were signed out. Please sign in again.',
+  expired_room: "Your sign-in had run out, so you were signed out. Sign in again and you'll go straight back to the room.",
+  join: "Sign in to join the room you were invited to. You'll go straight there afterwards.",
+}
+const notice = ref('')
 
 const form = ref({ username: '', password: '' })
 const loading = ref(false)
@@ -87,18 +97,18 @@ async function doLogin() {
   }
 }
 
-// Room.vue remembers a room link opened while signed out; go back to it.
+// A room link opened while signed out (or when the sign-in had run out) is
+// remembered; go back to it.
 function resumeAfterSignIn() {
-  let target = null
-  try {
-    target = sessionStorage.getItem('abs_party_return')
-    sessionStorage.removeItem('abs_party_return')
-  } catch { /* storage unavailable */ }
-  if (target && target.startsWith('/room/')) router.replace(target)
+  const target = takeRememberedRoom()
+  if (target) router.replace(target)
 }
 
 onMounted(async () => {
-  const { sso, sso_error: ssoError } = route.query
+  const { sso, sso_error: ssoError, signin } = route.query
+  if (signin === 'expired') notice.value = hasRememberedRoom() ? NOTICES.expired_room : NOTICES.expired
+  else if (signin === 'join' && hasRememberedRoom()) notice.value = NOTICES.join
+  if (signin && auth.token) router.replace('/') // signed in already (e.g. in another tab)
   if (!sso && !ssoError) return
   // Drop the code from the address bar (and history) straight away.
   router.replace('/')
@@ -142,6 +152,7 @@ button[type=submit]:disabled { opacity: 0.6; cursor: default; }
 .sso-button { display: block; text-align: center; text-decoration: none; padding: 0.7rem; background: #6c5ce7; border-radius: 6px; color: #fff; font-size: 1rem; }
 .divider { text-align: center; color: #888; font-size: 0.8rem; margin: 1rem 0 0.75rem; }
 .error { color: #ff7675; font-size: 0.85rem; margin: 0; }
+.notice { background: #0f3460; border-left: 3px solid #a29bfe; border-radius: 4px; padding: 0.6rem 0.75rem; color: #ddd; font-size: 0.9rem; margin: 0 0 1rem; }
 .actions button { width: 100%; padding: 0.7rem; background: #6c5ce7; border: none; border-radius: 6px; color: #fff; font-size: 1rem; cursor: pointer; }
 hr { border: none; border-top: 1px solid #0f3460; margin: 1.5rem 0; }
 </style>
