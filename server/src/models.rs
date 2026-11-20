@@ -33,6 +33,8 @@ pub enum ClientMessage {
     Speed {
         rate: f64,
     },
+    /// The person pressed Leave: give up the seat now instead of holding it.
+    Leave,
     Ping {
         sent_at: u64,
     },
@@ -83,6 +85,24 @@ pub enum ServerMessage {
     ParticipantLeft {
         name: String,
     },
+    /// Their connection dropped; the seat is held for them to come back.
+    ParticipantAway {
+        name: String,
+    },
+    /// They came back into their held seat.
+    ParticipantBack {
+        name: String,
+    },
+    /// The same person joined from another page or device, which now has the
+    /// seat. This connection is out of the room; the page stops reconnecting.
+    Replaced {
+        message: String,
+    },
+    /// No room with that id right now (never opened, or closed after standing
+    /// empty). A guest's page waits and asks again.
+    RoomNotFound {
+        message: String,
+    },
     HostChanged {
         name: String,
     },
@@ -123,6 +143,8 @@ pub fn is_abs_id(s: &str) -> bool {
 pub struct ParticipantInfo {
     pub name: String,
     pub is_host: bool,
+    /// Connection dropped, seat held ("reconnecting…" on the page).
+    pub away: bool,
 }
 
 // ABS API response types
@@ -235,6 +257,26 @@ mod tests {
         let msg = ServerMessage::AuthFailed { message: "again".into() };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"auth_failed""#));
+    }
+
+    #[test]
+    fn client_message_leave_deserializes() {
+        let msg: ClientMessage = serde_json::from_str(r#"{"type":"leave"}"#).unwrap();
+        assert!(matches!(msg, ClientMessage::Leave));
+    }
+
+    #[test]
+    fn server_messages_for_held_seats_serialize() {
+        let away = serde_json::to_value(ServerMessage::ParticipantAway { name: "Bob".into() }).unwrap();
+        assert_eq!(away, serde_json::json!({"type": "participant_away", "name": "Bob"}));
+        let back = serde_json::to_value(ServerMessage::ParticipantBack { name: "Bob".into() }).unwrap();
+        assert_eq!(back, serde_json::json!({"type": "participant_back", "name": "Bob"}));
+        let replaced = serde_json::to_value(ServerMessage::Replaced { message: "x".into() }).unwrap();
+        assert_eq!(replaced["type"], "replaced");
+        let missing = serde_json::to_value(ServerMessage::RoomNotFound { message: "x".into() }).unwrap();
+        assert_eq!(missing["type"], "room_not_found");
+        let info = serde_json::to_value(ParticipantInfo { name: "Bob".into(), is_host: false, away: true }).unwrap();
+        assert_eq!(info, serde_json::json!({"name": "Bob", "is_host": false, "away": true}));
     }
 
     #[test]

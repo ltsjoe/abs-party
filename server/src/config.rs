@@ -1,4 +1,5 @@
 use std::env;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -17,6 +18,46 @@ pub struct Config {
     pub local_login: bool,
     /// SAML single sign-on. None when SAML is not configured.
     pub saml: Option<SamlConfig>,
+    /// How long dropped seats and empty rooms are kept.
+    pub holds: Holds,
+}
+
+/// How long the server holds on when connections drop. Phones close their
+/// WebSocket whenever the browser goes to the background, e.g. to answer a
+/// text, so a dropped connection is usually someone coming right back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Holds {
+    /// A dropped connection's seat is kept this long for the person to come
+    /// back into it (SEAT_HOLD_SECS). Zero: a drop is a leave, as before.
+    pub seat: Duration,
+    /// A room nobody is in is kept this long, so its link still works when
+    /// people come back (ROOM_HOLD_MINUTES). Zero: it closes when empty.
+    pub room: Duration,
+}
+
+impl Default for Holds {
+    fn default() -> Self {
+        Self {
+            seat: Duration::from_secs(120),
+            room: Duration::from_secs(30 * 60),
+        }
+    }
+}
+
+impl Holds {
+    fn from_env() -> Self {
+        let default = Self::default();
+        let seat = env::var("SEAT_HOLD_SECS")
+            .map(|v| Duration::from_secs(v.parse().expect("SEAT_HOLD_SECS must be a whole number")))
+            .unwrap_or(default.seat);
+        let room = env::var("ROOM_HOLD_MINUTES")
+            .map(|v| {
+                let mins: u64 = v.parse().expect("ROOM_HOLD_MINUTES must be a whole number");
+                Duration::from_secs(mins * 60)
+            })
+            .unwrap_or(default.room);
+        Self { seat, room }
+    }
 }
 
 #[derive(Clone)]
@@ -145,6 +186,7 @@ impl Config {
             cors_origin: env::var("CORS_ORIGIN").ok(),
             local_login,
             saml,
+            holds: Holds::from_env(),
         }
     }
 
@@ -159,6 +201,7 @@ impl Config {
             cors_origin: None,
             local_login: true,
             saml: None,
+            holds: Holds::default(),
         }
     }
 }

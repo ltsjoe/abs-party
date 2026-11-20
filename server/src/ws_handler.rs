@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::abs_client::{is_auth_refusal, AbsClient};
-use crate::hub::{self};
+use crate::hub::{self, JoinError};
 use crate::models::{is_abs_id, AbsMeResponse, ClientMessage, ItemInfo, ServerMessage};
 use crate::room::Participant;
 use crate::AppState;
@@ -62,11 +62,15 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 };
 
-                let participant = Participant { id: participant_id, name: me.username.clone(), abs_token, abs_username: me.username, tx: tx.clone() };
+                let participant = Participant { id: participant_id, name: me.username.clone(), abs_token, abs_username: me.username, tx: tx.clone(), away: false };
 
+                leave_other_room(&state, &mut current_room, &rid, participant_id).await;
                 match hub::join_room(&state.rooms, &rid, participant).await {
                     Ok(()) => current_room = Some(rid),
-                    Err(e) => { let _ = tx.send(ServerMessage::Error { message: e }); }
+                    Err(JoinError::NotFound) => {
+                        let _ = tx.send(ServerMessage::RoomNotFound { message: hub::ROOM_NOT_FOUND.into() });
+                    }
+                    Err(JoinError::Invalid(message)) => { let _ = tx.send(ServerMessage::Error { message }); }
                 }
             }
 
@@ -87,8 +91,9 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
                 };
 
                 let item = ItemInfo { id: item_id, library_id, episode_id, title: item_title, author: item_author };
-                let participant = Participant { id: participant_id, name: me.username.clone(), abs_token, abs_username: me.username, tx: tx.clone() };
+                let participant = Participant { id: participant_id, name: me.username.clone(), abs_token, abs_username: me.username, tx: tx.clone(), away: false };
 
+                leave_other_room(&state, &mut current_room, &room_id, participant_id).await;
                 match hub::create_room(&state.rooms, room_id.clone(), item, participant).await {
                     Ok(true) => {
                         // New room created — send initial room_state
@@ -133,14 +138,29 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
                     hub::handle_speed(&state.rooms, rid, participant_id, rate).await;
                 }
             }
+            ClientMessage::Leave => {
+                if let Some(rid) = current_room.take() {
+                    hub::leave_room(&state.rooms, &rid, participant_id, state.config.holds).await;
+                }
+            }
             ClientMessage::Ping { sent_at } => {
                 let _ = tx.send(ServerMessage::Pong { sent_at });
             }
         }
     }
 
+    // Closed without a Leave (a phone switching apps, lost signal, a reload):
+    // hold the seat so the same person can come back into it.
     if let Some(rid) = current_room {
-        hub::leave_room(&state.rooms, &rid, participant_id).await;
+        hub::disconnect(&state.rooms, &rid, participant_id, state.config.holds).await;
+    }
+}
+
+/// One connection sits in one room. Joining a different room gives up the
+/// seat in the one it was in.
+async fn leave_other_room(state: &AppState, current_room: &mut Option<String>, next: &str, participant_id: Uuid) {
+    if let Some(old) = current_room.take_if(|r| r.as_str() != next) {
+        hub::leave_room(&state.rooms, &old, participant_id, state.config.holds).await;
     }
 }
 

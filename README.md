@@ -50,13 +50,26 @@ ABS keeps progress per episode, so each listener's progress for that episode is 
 When the book (or episode) has two or more chapters, the room shows the chapter playing, ⏮ / ⏭ buttons beside -10s / +10s, and a list of all chapters with the current one marked. Picking a chapter seeks there and takes the room along, the same as dragging the progress bar. ⏮ goes back to the start of the chapter playing, or to the chapter before when pressed in the first 3 seconds of one. The chapters come from the ABS playback session (`chapters` in `POST /api/items/:id/play`), so they are whatever ABS shows for the book.
 
 
+## Phones and dropped connections
+
+Phones close the connection whenever the browser goes to the background, for example to answer a text. So a dropped connection doesn't count as leaving:
+
+- **Your seat is held** for 2 minutes (`SEAT_HOLD_SECS`). The others see you as "reconnecting…" and keep listening; nothing pauses. When your page comes back it takes the seat back, host role included, and catches up with the room. If nobody else stayed connected, the room catches up with your page instead (it may have kept playing in the background).
+- **A room nobody is in is kept** for 30 minutes (`ROOM_HOLD_MINUTES`), so its link still works. Whoever walks in runs it until the person who opened it is back; they get host back.
+- **The same person opening the room again** (a second tab, another device, a link tapped twice) moves their seat to the newest page. The older page says so, goes quiet and stops reconnecting; its "Use this page" button takes the seat back.
+- A guest who opens the link before the host's page has opened the room sees "Waiting for the host to open the room…" and gets in once it's there.
+- **Leave** gives the seat up at once, and closes the room if you were the last one in.
+
+The page reconnects when you come back to it, and it opens a fresh connection when the old one stops answering pings for 15 seconds. That happens when a phone moves between Wi-Fi and mobile data and the browser hasn't noticed the old connection is dead.
+
+
 ## Security notes
 
 All ABS REST calls from the browser go through the `/api/abs-proxy/*` route on the party server rather than directly to ABS. This avoids CORS issues and lets the server enforce an allowlist of permitted endpoints. Only read and session-management calls are forwarded; write/delete/admin paths are blocked. A path with `..` in it, or a `%` left after decoding (double-encoded dots such as `%252e%252e` would otherwise turn back into `..` on the way to ABS), is refused.
 
 A room's item, library and episode ids come from its host and end up in every guest's relay calls, so `create_room` refuses any id that isn't a plain ABS id (letters, digits, `-` and `_`, up to 64 characters).
 
-Display names are taken from the ABS username and cannot be overridden. Two participants with the same ABS username cannot be in the same room simultaneously.
+Display names are taken from the ABS username and cannot be overridden. A room holds one seat per ABS username: joining again as the same user takes that seat over (see above), since ABS has already vouched that it is the same person.
 
 
 ## Environment variables
@@ -69,6 +82,8 @@ Display names are taken from the ABS username and cannot be overridden. Two part
 | `STATIC_DIR` | no | `./static` | Path to compiled Vue SPA files |
 | `CORS_ORIGIN` | no | -- | Allowed cross-origin (e.g. `http://localhost:5173` for Vite dev). Omit in production. |
 | `RUST_LOG` | no | -- | Log filter (e.g. `abs_party=info`) |
+| `SEAT_HOLD_SECS` | no | `120` | How long a dropped connection's seat is held for the person to come back. `0`: a dropped connection leaves the room at once. |
+| `ROOM_HOLD_MINUTES` | no | `30` | How long a room nobody is in is kept before it closes. `0`: it closes as soon as it is empty. |
 | `BYPASS_AUTH` | no | `0` | Set to `1` to skip ABS token validation. Never use in production. |
 | `LOCAL_LOGIN` | no | `1` | Set to `0` to turn off the ABS username/password and API key sign-in. Needs SAML configured. |
 | `SAML_IDP_METADATA_URL` / `SAML_IDP_METADATA_FILE` | no | -- | IdP metadata. Setting either one turns on SAML sign-in (see below). |

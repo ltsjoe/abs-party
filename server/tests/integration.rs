@@ -369,3 +369,114 @@ async fn websocket_tells_a_refused_token_apart_from_abs_being_down() {
     assert_eq!(down["type"], "error", "{down}");
     assert!(down["message"].as_str().unwrap().contains("could not be reached"), "{down}");
 }
+
+// --- Phones that drop their connection (switching apps to text someone) ---
+// With bypass_auth the token is the username, so "alice" twice is one person.
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn ws_connect(addr: std::net::SocketAddr) -> Ws {
+    tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap().0
+}
+
+async fn ws_send(ws: &mut Ws, msg: serde_json::Value) {
+    ws.send(Message::Text(msg.to_string())).await.unwrap();
+}
+
+/// Next message, or panic after 2 s (a missing message should fail, not hang).
+async fn ws_next(ws: &mut Ws) -> serde_json::Value {
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("timed out waiting for a message")
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&msg.into_text().unwrap()).unwrap()
+}
+
+fn create_msg(token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "create_room", "room_id": "phone123", "abs_token": token,
+        "item_id": "item1", "item_title": "Test Book", "item_author": "Test Author", "library_id": "lib1"
+    })
+}
+
+fn join_msg(token: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "join", "room_id": "phone123", "abs_token": token })
+}
+
+#[tokio::test]
+async fn websocket_same_person_twice_newest_connection_wins() {
+    let addr = spawn_test_server().await;
+    let mut host = ws_connect(addr).await;
+    ws_send(&mut host, create_msg("alice")).await;
+    assert_eq!(ws_next(&mut host).await["type"], "room_state");
+
+    let mut tab1 = ws_connect(addr).await;
+    ws_send(&mut tab1, join_msg("bob")).await;
+    assert_eq!(ws_next(&mut tab1).await["type"], "room_state");
+    assert_eq!(ws_next(&mut host).await["type"], "participant_joined");
+
+    // Bob opens the link again (a second tab, or the page reconnecting before
+    // the server noticed the old connection was gone). This used to be "Username taken".
+    let mut tab2 = ws_connect(addr).await;
+    ws_send(&mut tab2, join_msg("bob")).await;
+    let state = ws_next(&mut tab2).await;
+    assert_eq!(state["type"], "room_state");
+    let names: Vec<&str> = state["participants"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["alice", "bob"]);
+    assert_eq!(ws_next(&mut tab1).await["type"], "replaced");
+
+    // The host sees nothing change; the next thing it gets is its own pong.
+    ws_send(&mut host, serde_json::json!({"type": "ping", "sent_at": 1})).await;
+    assert_eq!(ws_next(&mut host).await["type"], "pong");
+}
+
+#[tokio::test]
+async fn websocket_room_survives_the_host_switching_apps() {
+    let addr = spawn_test_server().await;
+    let mut host = ws_connect(addr).await;
+    ws_send(&mut host, create_msg("alice")).await;
+    assert_eq!(ws_next(&mut host).await["type"], "room_state");
+
+    // The host's phone drops the connection (Chrome went to the background).
+    host.close(None).await.unwrap();
+    drop(host);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The guest opens the link meanwhile: the room is there, host shown as away.
+    // This used to be "Room not found".
+    let mut guest = ws_connect(addr).await;
+    ws_send(&mut guest, join_msg("bob")).await;
+    let state = ws_next(&mut guest).await;
+    assert_eq!(state["type"], "room_state");
+    let alice = &state["participants"][0];
+    assert_eq!((alice["name"].as_str(), alice["is_host"].as_bool(), alice["away"].as_bool()), (Some("alice"), Some(true), Some(true)));
+
+    // The host's page reconnects and sends create_room again, as Room.vue does.
+    let mut host2 = ws_connect(addr).await;
+    ws_send(&mut host2, create_msg("alice")).await;
+    let back = ws_next(&mut host2).await;
+    assert_eq!(back["type"], "room_state");
+    assert_eq!(back["participants"].as_array().unwrap().len(), 2);
+    assert_eq!(back["participants"][0]["is_host"], true);
+    assert_eq!(back["participants"][0]["away"], false);
+    let to_guest = ws_next(&mut guest).await;
+    assert_eq!((to_guest["type"].as_str(), to_guest["name"].as_str()), (Some("participant_back"), Some("alice")));
+}
+
+#[tokio::test]
+async fn websocket_leave_closes_an_empty_room_at_once() {
+    let addr = spawn_test_server().await;
+    let mut host = ws_connect(addr).await;
+    ws_send(&mut host, create_msg("alice")).await;
+    assert_eq!(ws_next(&mut host).await["type"], "room_state");
+
+    ws_send(&mut host, serde_json::json!({"type": "leave"})).await;
+    ws_send(&mut host, serde_json::json!({"type": "ping", "sent_at": 2})).await;
+    assert_eq!(ws_next(&mut host).await["type"], "pong"); // leave was handled
+
+    let mut guest = ws_connect(addr).await;
+    ws_send(&mut guest, join_msg("bob")).await;
+    let reply = ws_next(&mut guest).await;
+    assert_eq!(reply["type"], "room_not_found");
+}
