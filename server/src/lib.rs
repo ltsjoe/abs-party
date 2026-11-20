@@ -114,9 +114,14 @@ pub async fn run() {
         }
         None => None,
     };
+    let holds = config.holds;
     let app = build_app_with_saml(config, saml);
 
-    tracing::info!("abs-party listening on {bind}");
+    tracing::info!(
+        "abs-party listening on {bind}; dropped seats kept {} s, empty rooms {} min",
+        holds.seat.as_secs(),
+        holds.room.as_secs() / 60
+    );
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .expect("bind failed");

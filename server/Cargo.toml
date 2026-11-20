@@ -31,6 +31,8 @@ samael = "0.0.22"
 rand = "0.9"
 
 [dev-dependencies]
+# test-util: paused clock for the seat/room hold tests (no extra crates)
+tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 axum = { version = "0.7", features = ["ws"] }

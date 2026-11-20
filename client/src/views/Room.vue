@@ -3,7 +3,19 @@
     <!-- Error / loading states -->
     <div v-if="fatalError" class="fatal">
       <p>{{ fatalError }}</p>
-      <button @click="router.push('/')">Go home</button>
+      <div class="fatal-actions">
+        <button @click="reload">Try again</button>
+        <button @click="router.push('/')">Go home</button>
+      </div>
+    </div>
+
+    <!-- The same person opened the room on another page or device, which has the seat now -->
+    <div v-else-if="replacedHere" class="fatal replaced">
+      <p>This room is open on another page or device, so this page left it.</p>
+      <div class="fatal-actions">
+        <button @click="useThisPage">Use this page</button>
+        <button @click="router.push('/')">Go home</button>
+      </div>
     </div>
 
     <template v-else>
@@ -32,7 +44,7 @@
               ✅ Bookmark saved at your previous position — you can restore it from the ABS bookmarks panel.
             </template>
           </div>
-          <div v-if="preparing" class="status">Opening playback session…</div>
+          <div v-if="preparing" class="status">{{ waitingForHost ? 'Waiting for the host to open the room…' : 'Opening playback session…' }}</div>
 
           <div v-else class="player">
             <!-- Cover -->
@@ -112,8 +124,9 @@
         <div class="sidebar">
           <h3>Listeners ({{ participants.length }})</h3>
           <ul class="participant-list">
-            <li v-for="p in participants" :key="p.name" :class="{ host: p.is_host }">
+            <li v-for="p in participants" :key="p.name" :class="{ host: p.is_host, away: p.away }">
               {{ p.name }}<span v-if="p.is_host" class="host-badge">host</span>
+              <span v-if="p.away" class="away-badge">reconnecting…</span>
             </li>
           </ul>
 
@@ -166,6 +179,7 @@ import { shortenTitle } from '../utils/title.js'
 import { episodeLabel, episodeBookmarkTitle, bookmarksForRoom, canBookmarkAt } from '../utils/bookmarks.js'
 import { rememberRoom } from '../utils/session.js'
 import { chapterIndexAt, prevChapterStart, nextChapterStart } from '../utils/chapters.js'
+import { othersHere, shouldLead, applyParticipantEvent } from '../utils/roomSync.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -178,6 +192,12 @@ const isHostMode = route.query.host === 'true'  // constant: this tab intends to
 const displayName = computed(() => auth.username)
 
 const fatalError = ref('')
+// Another page or device of this same person took the seat (see 'replaced').
+const replacedHere = ref(false)
+// The room isn't open (yet, or any more): this guest page asks again.
+const waitingForHost = ref(false)
+const JOIN_RETRY_MS = 5000
+let joinRetryTimer = null
 const preparing = ref(true)
 const bookmarkSaved = ref(false)
 const buffering = ref(false)
@@ -202,7 +222,11 @@ watchEffect(() => {
     document.title = 'ABS Party'
   }
 })
-onUnmounted(() => { document.title = previousTitle })
+onUnmounted(() => {
+  document.title = previousTitle
+  clearTimeout(joinRetryTimer)
+  document.removeEventListener('visibilitychange', retryJoinWhenVisible)
+})
 
 let bufferingTimeout = null
 let bufferingReadyCb = null
@@ -214,13 +238,17 @@ const player = useAbsPlayer(absBase)
 const { events: eventLog, addEvent } = useEventLog()
 const { playJoinLeave, playAlert } = useAudioCues(player.volume)
 
-const { connect, send, connected, rtt } = useWebSocket(handleMessage)
+const { connect, send, disconnect, connected, rtt } = useWebSocket(handleMessage)
 const { handleMessage: applySyncMsg } = useSyncEngine(player, rtt, () => {
   addEvent('Desync detected — correcting…', 'alert')
   playAlert()
 })
 
+let leaving = false
+
 watch(connected, (val, old) => {
+  // Disconnected on purpose (Leave, replaced, an error screen): nothing to report.
+  if (leaving || fatalError.value || replacedHere.value) return
   if (old && !val) {
     participants.value = []
     addEvent('Connection lost — reconnecting…', 'alert')
@@ -288,6 +316,8 @@ onMounted(async () => {
 
 async function handleMessage(msg) {
   if (msg.type === 'room_state') {
+    waitingForHost.value = false
+    clearTimeout(joinRetryTimer)
     roomState.item = msg.item
     roomState.position = msg.position
     roomState.playing = msg.playing
@@ -296,6 +326,7 @@ async function handleMessage(msg) {
 
     const me = participants.value.find(p => p.name === displayName.value)
     isHost.value = me?.is_host ?? false
+    const others = othersHere(participants.value, displayName.value)
 
     // Now open the player (saves bookmark, creates ABS session)
     if (preparing.value && auth.token && roomState.item?.id) {
@@ -308,48 +339,66 @@ async function handleMessage(msg) {
         bookmarkSaved.value = player.preJoinBookmarkSaved.value
         setTimeout(() => { bookmarkSaved.value = false }, 5000)
         await loadBookmarks()
-        if (isHostMode) {
-          // Host: start from their own last ABS position and publish it so guests sync correctly
+        if (shouldLead({ firstOpen: true, isHostMode, others })) {
+          // Host opening the room: start from their own last ABS position and publish it so guests sync correctly
           const startPos = Math.max(0, session.currentTime ?? 0)
           player.seekTo(startPos)
           send({ type: 'seek', position: startPos })
         } else {
-          // Guest: follow the room's canonical position
+          // Follow the room's canonical position (a guest, or the host reopening a room others are in)
           player.seekTo(roomState.position)
           if (roomState.playing) player.play()
         }
       } catch (e) {
         fatalError.value = 'Failed to open playback session: ' + e.message
       }
+    } else if (shouldLead({ firstOpen: false, isHostMode, others })) {
+      // Back after a drop with nobody else here: this page is the truth (it
+      // may have kept playing in the background), so the room takes its state.
+      leadRoom()
     } else {
-      // Reconnect: player already open — resync state
-      if (isHostMode) {
-        const pos = player.currentTime.value
-        send({ type: 'seek', position: pos })
-      } else {
-        player.seekTo(roomState.position)
-        if (roomState.playing) player.play()
-        else player.pause()
-      }
+      // Back after a drop: take the room's state from the people who stayed
+      player.seekTo(roomState.position)
+      if (roomState.playing) player.play()
+      else player.pause()
     }
     return
   }
 
-  if (msg.type === 'participant_joined') {
-    participants.value.push({ name: msg.name, is_host: false })
-    addEvent(`${msg.name} joined`, 'normal')
-    playJoinLeave()
-    return
-  }
-  if (msg.type === 'participant_left') {
-    participants.value = participants.value.filter(p => p.name !== msg.name)
-    addEvent(`${msg.name} left`, 'normal')
-    playJoinLeave()
+  if (['participant_joined', 'participant_left', 'participant_away', 'participant_back'].includes(msg.type)) {
+    participants.value = applyParticipantEvent(participants.value, msg)
+    const what = {
+      participant_joined: 'joined',
+      participant_left: 'left',
+      participant_away: 'is reconnecting…',
+      participant_back: 'is back',
+    }[msg.type]
+    addEvent(`${msg.name} ${what}`, 'normal')
+    if (msg.type === 'participant_joined' || msg.type === 'participant_left') playJoinLeave()
     return
   }
   if (msg.type === 'host_changed') {
     participants.value = participants.value.map(p => ({ ...p, is_host: p.name === msg.name }))
     isHost.value = msg.name === displayName.value
+    return
+  }
+  if (msg.type === 'replaced') {
+    // This person opened the room on another page or device, which has the
+    // seat now. Stop for good, so the two pages don't keep taking it back.
+    replacedHere.value = true
+    disconnect()
+    cancelBuffering()
+    player.pause()
+    return
+  }
+  if (msg.type === 'room_not_found') {
+    // The host's page hasn't opened the room (yet, or again after it stood
+    // empty and closed): wait and ask again.
+    if (!waitingForHost.value && !preparing.value) {
+      addEvent('The room closed. Waiting for the host to open it again…', 'alert')
+    }
+    waitingForHost.value = true
+    scheduleJoinRetry()
     return
   }
   if (msg.type === 'auth_failed') {
@@ -359,6 +408,9 @@ async function handleMessage(msg) {
   }
   if (msg.type === 'error') {
     fatalError.value = msg.message
+    // No reconnecting behind the error screen: that used to rejoin quietly
+    // and hold this person's place while the page said it had failed.
+    disconnect()
     return
   }
 
@@ -401,6 +453,41 @@ function cancelBuffering() {
     player.audio.removeEventListener('canplaythrough', bufferingReadyCb)
     bufferingReadyCb = null
   }
+}
+
+// Ask for the room again every few seconds, but only while this page is on
+// screen: a hidden tab that got in later would take the seat from the page
+// the person is actually using.
+function scheduleJoinRetry() {
+  clearTimeout(joinRetryTimer)
+  joinRetryTimer = setTimeout(() => {
+    if (!waitingForHost.value || fatalError.value || replacedHere.value) return
+    if (document.visibilityState === 'visible') rejoinRoom()
+    else document.addEventListener('visibilitychange', retryJoinWhenVisible, { once: true })
+  }, JOIN_RETRY_MS)
+}
+
+function retryJoinWhenVisible() {
+  if (waitingForHost.value && document.visibilityState === 'visible') rejoinRoom()
+}
+
+// Alone in the room after a reconnect: make the room match this page.
+function leadRoom() {
+  const pos = player.currentTime.value
+  if (player.isPlaying.value && !roomState.playing) send({ type: 'play_intent', position: pos })
+  else if (!player.isPlaying.value && roomState.playing) send({ type: 'pause', position: pos })
+  else send({ type: 'seek', position: pos })
+}
+
+// "Use this page" after another page took the seat: connect again; the
+// connected watcher rejoins, which takes the seat back here.
+function useThisPage() {
+  replacedHere.value = false
+  connect()
+}
+
+function reload() {
+  location.reload()
 }
 
 function rejoinRoom() {
@@ -533,6 +620,10 @@ async function addBookmark() {
 }
 
 async function leaveRoom() {
+  // Give the seat up now; a connection that just drops holds it for a while.
+  leaving = true
+  send({ type: 'leave' })
+  disconnect()
   await player.close()
   router.push('/')
 }
@@ -626,8 +717,13 @@ function fmt(s) {
 .participant-list li { font-size: 0.9rem; color: #e0e0e0; display: flex; align-items: center; gap: 0.5rem; }
 .participant-list li.host { color: #a29bfe; font-weight: 600; }
 .host-badge { font-size: 0.7rem; background: #6c5ce7; color: #fff; padding: 0.15rem 0.4rem; border-radius: 4px; }
+.participant-list li.away { opacity: 0.6; }
+.away-badge { font-size: 0.7rem; color: #aaa; font-style: italic; }
 .fatal { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; gap: 1rem; color: #ff7675; }
 .fatal button { background: #6c5ce7; border: none; border-radius: 6px; color: #fff; padding: 0.6rem 1.5rem; cursor: pointer; }
+.fatal p { text-align: center; padding: 0 1rem; }
+.fatal-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; }
+.fatal.replaced { color: #e0e0e0; }
 
 .event-log { background: #080815; border-top: 1px solid #0f3460; padding: 0.35rem 1rem; font-family: monospace; font-size: 0.72rem; display: flex; flex-direction: column; gap: 0.1rem; }
 .event-entry { display: flex; gap: 0.75rem; }
